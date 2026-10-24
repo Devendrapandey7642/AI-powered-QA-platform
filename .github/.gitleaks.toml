@@ -1,0 +1,78 @@
+# .gitleaks.toml — Gitleaks secrets scanning configuration
+#
+# Scans every commit for accidentally committed secrets (API keys, JWT secrets,
+# OAuth credentials, etc.).  Run automatically by the CI "secrets" job on every
+# PR and push to main.
+#
+# Docs: https://github.com/gitleaks/gitleaks#configuration
+
+title = "AI Powered QA Platform gitleaks config"
+
+[extend]
+# Extend the official gitleaks default ruleset so we inherit all built-in
+# detectors (AWS, GitHub, Anthropic, OpenAI, Google, etc.) without having
+# to re-declare them.
+useDefault = true
+
+# ─── Global allowlist ─────────────────────────────────────────────────────────
+# Patterns listed here are never flagged regardless of which rule matched them.
+# Add entries only for values that are intentionally public (CI placeholders,
+# .env.example dummy values, test fixtures).
+
+[allowlist]
+  description = "CI placeholders and .env.example dummy values"
+
+  # Allow the literal placeholder key used in CI smoke tests.
+  # This value is never a real secret — it is rejected by the Anthropic API.
+  regexes = [
+    "sk-ant-placeholder-for-ci",
+  ]
+
+  # .env.example documents variable names with empty or obviously-fake values.
+  # Allow the whole file so contributors can update it freely.
+  # Test files may contain fake provider keys used only to exercise detection
+  # logic (never valid credentials).
+  paths = [
+    "backend/.env.example",
+    "backend/.env.example.test",
+    "backend/tests/openrouter-provider.test.js",
+    "backend/tests/secret-scanner.test.js",
+    "backend/tests/openai-compat-provider.test.js",
+    "backend/tests/compat-config-cache.test.js",
+    # SEC-007 — drives the auth.api_key.{create,revoke} audit-log assertion
+    # path with a fake API key value. The route's ≥10-char validation accepts
+    # any string; the assertion confirms the raw key never lands in the audit
+    # row. Allowlisted so the scanner doesn't flag the test fixture as a real
+    # credential (same pattern as the OpenAI-compat tests above).
+    "backend/tests/audit-auth-events.test.js",
+    # SEC-007 — exercises the SIEM forwarder's HMAC-signing path with a fake
+    # workspace `hmacSecret`. The string is a literal test fixture asserted
+    # against round-tripped encryption, never a real credential.
+    "backend/tests/audit-siem-forwarder.test.js",
+    # INF-007 — exercises the /metrics Bearer-token auth path. The current
+    # tip generates the token at runtime via `crypto.randomBytes`, but the
+    # earlier PR commit (791c74d5) contained a literal `"test-scrape-key-…"`
+    # placeholder that the scanner still walks via the per-commit log diff.
+    # Allowlisted so the historical commit doesn't fail CI; the production
+    # `METRICS_SCRAPE_KEY` is generated via the documented `randomBytes(32)`
+    # recipe in `docs/guide/env-vars.md`, never a literal in source.
+    "backend/tests/observability.test.js",
+    # B2.1 — backfill-routes correctness tests carry fake provider keys
+    # (`sk-ant-test-…`, `sk-openai-test-…`) that exercise the `apiKeyRepo`
+    # encryption + `apiKeyLastFour` extraction. The current tip uses
+    # `fake-test-key-…` shaped to NOT trigger Gitleaks heuristics, but
+    # an earlier PR commit (70fa7b21) used `sk-compat-test-…` on the
+    # property literally named `apiKey`, which the `generic-api-key` rule
+    # flags. Allowlisted so the historical commit doesn't fail CI;
+    # production code never reads test-fixture key strings.
+    "backend/tests/migration-routeid.test.js",
+    "backend/tests/routes-import-export.test.js",
+    "backend/tests/provider-routes-api.test.js"
+  ]
+
+  # Test fixtures and seed data may contain fake credentials for testing auth
+  # flows.  Scope the allowlist tightly to the tests directory.
+  # Uncomment and extend as needed:
+  # paths = [
+  #   "backend/tests/fixtures",
+  # ]

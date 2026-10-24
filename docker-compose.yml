@@ -1,0 +1,188 @@
+# docker-compose.yml — Run the full AI Powered QA Platform stack.
+#
+# Local build:       docker compose up --build
+# From GHCR images:  docker compose pull && docker compose up
+#
+# Frontend (nginx) proxies /api/* → backend:3001 automatically.
+# Open http://localhost:3000 in your browser.
+#
+# ─── Database (INF-001) ───────────────────────────────────────────────────────
+# By default AI Powered QA Platform uses SQLite (zero config, data in backend/data/sentri.db).
+# To use PostgreSQL instead, uncomment the `postgres` service below and set
+# DATABASE_URL on the backend service:
+#
+#   DATABASE_URL=postgres://sentri:sentri@postgres:5432/sentri
+#
+# Then: docker compose --profile postgres up --build
+
+services:
+  backend:
+    image: ghcr.io/devendrapandey7642/ai-powered-qa-platform-backend:latest
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: sentri-backend
+    environment:
+      - AI_PROVIDER=${AI_PROVIDER}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL}
+      - OPENROUTER_BASE_URL=${OPENROUTER_BASE_URL}
+      - OPENROUTER_REFERER=${OPENROUTER_REFERER}
+      - OPENROUTER_APP_TITLE=${OPENROUTER_APP_TITLE}
+      - JWT_SECRET=${JWT_SECRET}
+      - PORT=3001
+      - NODE_ENV=production
+      - PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+      - PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+      # SEC-002: Point at the frontend dist copied into the shared volume so
+      # serveIndexWithNonce() can inject per-request CSP nonces into index.html.
+      - SPA_INDEX_PATH=/usr/share/frontend/index.html
+      # DATABASE_URL / REDIS_URL are read from the host env (or .env file) so
+      # the backend and `worker` service stay in lockstep — both consume the
+      # same source. Leave both unset for the default single-process SQLite
+      # deployment (BullMQ is a no-op without REDIS_URL, so jobs run in-process
+      # and any `worker` replicas sit idle). For distributed mode (AUTO-008),
+      # set both — typically via .env:
+      #   DATABASE_URL=postgres://sentri:sentri@postgres:5432/sentri
+      #   REDIS_URL=redis://redis:6379
+      # then run with `--profile redis --profile postgres`. Workers MUST share
+      # the backend's database (SQLite cannot be shared across containers).
+      - DATABASE_URL=${DATABASE_URL:-}
+      - REDIS_URL=${REDIS_URL:-}
+    ports:
+      - "3001:3001"
+    restart: unless-stopped
+    security_opt:
+      - seccomp=unconfined
+    shm_size: "256mb"
+    volumes:
+      - frontend_dist:/usr/share/frontend:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+
+  # ── Distributed runner worker (AUTO-008) ────────────────────────────────────
+  # Same image as `backend`; overrides CMD to run the queue-only entrypoint
+  # (`src/worker.js`) so workers don't bind port 3001. Scale with:
+  #   docker compose --profile redis --profile postgres up -d --scale worker=4
+  # Lives under the `redis` profile because BullMQ requires Redis. The
+  # `postgres` profile is also required by default because workers MUST share
+  # the backend's database (see DATABASE_URL note below) — SQLite cannot be
+  # shared across replicas. Omit `--profile postgres` only if you've pointed
+  # DATABASE_URL at an externally-managed PostgreSQL instance.
+  worker:
+    image: ghcr.io/devendrapandey7642/ai-powered-qa-platform-backend:latest
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    profiles:
+      - redis
+    command: ["node", "--import", "./src/otel-preload.mjs", "src/worker.js"]
+    environment:
+      - AI_PROVIDER=${AI_PROVIDER}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL}
+      - OPENROUTER_BASE_URL=${OPENROUTER_BASE_URL}
+      - OPENROUTER_REFERER=${OPENROUTER_REFERER}
+      - OPENROUTER_APP_TITLE=${OPENROUTER_APP_TITLE}
+      - JWT_SECRET=${JWT_SECRET}
+      - NODE_ENV=production
+      - PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+      - PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-2}
+      # Workers MUST share the same database as the backend. Distributed mode
+      # therefore requires a network-accessible DB (PostgreSQL) — a per-container
+      # SQLite file cannot be shared across replicas. If DATABASE_URL is unset
+      # we default to the bundled `postgres` service (activate with
+      # `--profile redis --profile postgres`).
+      - DATABASE_URL=${DATABASE_URL:-postgres://sentri:sentri@postgres:5432/sentri}
+    restart: unless-stopped
+    security_opt:
+      - seccomp=unconfined
+    shm_size: "256mb"
+    depends_on:
+      redis:
+        condition: service_healthy
+      # Wait for the bundled `postgres` service when it's part of the active
+      # profile set. `required: false` means workers still start cleanly when
+      # the operator points DATABASE_URL at an externally-managed PostgreSQL
+      # and runs without `--profile postgres` — in that case the `postgres`
+      # service is inactive and Compose skips this dependency instead of
+      # erroring out.
+      postgres:
+        condition: service_healthy
+        required: false
+
+  frontend:
+    image: ghcr.io/devendrapandey7642/ai-powered-qa-platform-frontend:latest
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: sentri-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - frontend_dist:/usr/share/frontend_dist
+
+  # ── Optional Redis service (INF-002) ─────────────────────────────────────────
+  # Activate with: docker compose --profile redis up
+  # Set REDIS_URL on the backend service (see above).
+  redis:
+    image: redis:7-alpine
+    container_name: sentri-redis
+    profiles:
+      - redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Optional PostgreSQL service (INF-001) ──────────────────────────────────
+  # Activate with: docker compose --profile postgres up
+  # Set DATABASE_URL on the backend service (see above).
+  postgres:
+    image: postgres:16-alpine
+    container_name: sentri-postgres
+    profiles:
+      - postgres
+    environment:
+      POSTGRES_USER: sentri
+      POSTGRES_PASSWORD: sentri
+      POSTGRES_DB: sentri
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentri"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+networks:
+  default:
+    name: sentri-network
+
+volumes:
+  pgdata:
+  frontend_dist:

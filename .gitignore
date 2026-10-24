@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Build output
+frontend/dist/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+
+# Generated API docs (JSDoc)
+backend/docs-api/
+
+# Generated trace viewer bundle (copied at install time by backend/scripts/copy-trace-viewer.js)
+backend/public/trace-viewer/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Data persistence
+backend/data/
+
+# Playwright artifacts
+backend/artifacts/
+tests/e2e/artifacts/
+tests/e2e/EXECUTION_REPORT.md
+backend/tests/fixtures/eval-goldens/.cache/*
+!backend/tests/fixtures/eval-goldens/.cache/*.txt
+!backend/tests/fixtures/eval-goldens/.cache/.gitkeep
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

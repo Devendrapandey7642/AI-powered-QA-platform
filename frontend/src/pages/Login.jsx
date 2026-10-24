@@ -1,0 +1,831 @@
+import React, { useState, useEffect, useRef } from "react";
+import { useNavigate, useLocation, Link } from "react-router-dom";
+import { useAuth } from "../context/AuthContext.jsx";
+import AppLogo from "../components/layout/AppLogo.jsx";
+import { api } from "../api.js";
+import usePageTitle from "../hooks/usePageTitle.js";
+import "../styles/pages/login.css";
+
+const GITHUB_CLIENT_ID = import.meta.env.VITE_GITHUB_CLIENT_ID || "";
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
+
+function GitHubIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor">
+      <path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/>
+    </svg>
+  );
+}
+
+function GoogleIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="17" height="17">
+      <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+      <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+      <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+      <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+    </svg>
+  );
+}
+
+function Spinner() {
+  return (
+    <svg style={{animation:'spinAnim 0.8s linear infinite',display:'inline-block'}} viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2.5">
+      <circle cx="12" cy="12" r="10" strokeOpacity="0.2"/>
+      <path d="M12 2a10 10 0 0 1 10 10"/>
+    </svg>
+  );
+}
+
+const FEATURES = [
+  { icon: "⚡", title: "AI-Powered Test Generation", desc: "Generate comprehensive test suites from your app in seconds" },
+  { icon: "🔁", title: "Self-Healing Tests", desc: "Tests that automatically adapt when your UI changes" },
+  { icon: "📊", title: "Real-time Analytics", desc: "Deep insights into test coverage, pass rates and trends" },
+];
+
+const TESTIMONIALS = [
+  { quote: "AI Powered QA Platform cut our QA cycle from 3 days to 20 minutes.", name: "Priya S.", role: "Engineering Lead" },
+  { quote: "The self-healing alone saves us hours every sprint.", name: "Marcus T.", role: "Senior Dev" },
+  { quote: "Best DX of any testing tool I've used in 10 years.", name: "Aiko N.", role: "CTO" },
+];
+
+export default function Login() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { login, user } = useAuth();
+
+  const [mode, setMode] = useState("login");
+  usePageTitle(mode === "login" ? "Sign in" : "Create account");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [name, setName] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [oauthLoading, setOauthLoading] = useState(null);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  const [mounted, setMounted] = useState(false);
+  const [tIdx, setTIdx] = useState(0);
+  const [verifyEmail, setVerifyEmail] = useState(""); // SEC-001: email needing verification
+  const [resending, setResending] = useState(false);
+  // SEC-004: MFA challenge state — after `/login` succeeds with `mfaRequired`,
+  // we render an overlay with a factor picker (TOTP / passkey / recovery code).
+  // `mfaMethods` mirrors the `methods` map on the login response so we know
+  // which factors the user actually has registered.
+  const [mfaPendingToken, setMfaPendingToken] = useState("");
+  // SEC-004 (F3): per-factor input state. The TOTP and recovery-code panels
+  // each own their own buffer so switching tabs mid-typo preserves the
+  // partial input the user already typed (better UX). Each panel's submit
+  // path reads ONLY its own buffer, so the original wrong-tab-submission
+  // bug (a recovery code accidentally sent through the TOTP submit path
+  // and silently consumed) is structurally impossible — the TOTP submit
+  // sees `mfaTotpCode`, the recovery submit sees `mfaRecoveryCode`.
+  const [mfaTotpCode, setMfaTotpCode] = useState("");
+  const [mfaRecoveryCode, setMfaRecoveryCode] = useState("");
+  const [mfaMethods, setMfaMethods] = useState({ totp: false, webauthn: false });
+  // "totp" = 6-digit input · "recovery" = 8-char alpha input · "webauthn" = passkey flow
+  const [mfaFactor, setMfaFactor] = useState("totp");
+  const [webauthnBusy, setWebauthnBusy] = useState(false);
+  // SEC-004: When the workspace requires MFA and the user is past grace,
+  // `/login` returns 403 MFA_ENROLLMENT_REQUIRED. We surface a dedicated
+  // panel because the user cannot self-enroll without a session — they
+  // must contact a workspace admin.
+  const [mfaEnrollmentRequired, setMfaEnrollmentRequired] = useState(null);
+  // SEC-004: Grace-period banner data is captured from the
+  // `X-MFA-Grace-Period-Days-Remaining` response header on a successful
+  // login and persisted to sessionStorage (key `mfa_grace_banner`) so the
+  // post-login surfaces (dashboard, navbar) can render it after navigation.
+  // No component-local state is needed here — the banner lives downstream.
+
+  const from = location.state?.from?.pathname || "/dashboard";
+
+  useEffect(() => {
+    setMounted(true);
+    const params = new URLSearchParams(location.search);
+
+    // SEC-001: Handle email verification token from link
+    const verifyToken = params.get("verify");
+    if (verifyToken) {
+      handleVerifyToken(verifyToken);
+      return;
+    }
+
+    const code = params.get("code");
+    const provider = params.get("provider");
+    const err = params.get("error");
+    if (err) {
+      const decoded = decodeURIComponent(err);
+      const friendlyErrors = {
+        access_denied: "Access denied — check that the redirect URI in Google/GitHub Cloud Console matches exactly: " + window.location.origin + "/login?provider=" + (provider || "google"),
+        invalid_client: "Invalid OAuth client ID — verify VITE_GOOGLE_CLIENT_ID in frontend/.env matches the Client ID in Google Cloud Console",
+        redirect_uri_mismatch: "Redirect URI mismatch — add this exact URI to your OAuth app: " + window.location.origin + "/login?provider=" + (provider || "google"),
+      };
+      setError(friendlyErrors[decoded] || decoded);
+      window.history.replaceState({}, "", `${import.meta.env.BASE_URL}login`);
+      return;
+    }
+    if (code && provider && ["github", "google"].includes(provider)) handleOAuthCallback(provider, code);
+  }, []);
+
+  async function handleVerifyToken(token) {
+    setLoading(true); setError(""); setSuccess("");
+    try {
+      const data = await api.verifyEmail(token);
+      setSuccess(data.message || "Email verified successfully! You can now sign in.");
+      setMode("login");
+    } catch (e) { setError(e.message); }
+    finally { setLoading(false); window.history.replaceState({}, "", `${import.meta.env.BASE_URL}login`); }
+  }
+
+  async function handleResendVerification() {
+    if (!verifyEmail || resending) return;
+    setResending(true); setError("");
+    try {
+      const data = await api.resendVerification(verifyEmail);
+      setSuccess(data.message || "Verification email sent! Please check your inbox.");
+    } catch (e) { setError(e.message); }
+    finally { setResending(false); }
+  }
+
+  const [testiPaused, setTestiPaused] = useState(false);
+  useEffect(() => { if (user) navigate(from, { replace: true }); }, [user]);
+  useEffect(() => { if (testiPaused) return; const t = setInterval(() => setTIdx(i => (i+1) % TESTIMONIALS.length), 4000); return () => clearInterval(t); }, [testiPaused]);
+
+  // SEC-004 a11y: dismiss MFA modals on Escape, trap Tab cycling inside the
+  // dialog, and capture the previously focused element so we can restore
+  // focus on close. Mirrors the pattern in Settings.jsx PasswordConfirmModal.
+  // Without these the dialog role + aria-modal=true would lie to AT users —
+  // background `inert` already prevents Tab from leaving the overlay, but the
+  // wrap-around keeps focus circling the modal's own controls per WAI-ARIA
+  // APG dialog guidance.
+  const modalOpen = !!mfaPendingToken || !!mfaEnrollmentRequired;
+  const lastFocusedRef = useRef(null);
+  // Selector for elements that participate in the focus trap. Mirrors the
+  // commonly accepted "tabbable" set — buttons, links, inputs, etc., minus
+  // anything explicitly opted out via tabindex="-1".
+  const FOCUSABLE_SELECTOR =
+    'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  useEffect(() => {
+    if (!modalOpen) return;
+    lastFocusedRef.current = document.activeElement;
+    function onKey(e) {
+      if (e.key === "Escape") {
+        // Don't allow Escape mid-passkey-verification — the browser's WebAuthn
+        // prompt has its own cancel UI and aborting the React modal would
+        // leave the passkey API in a confused state.
+        if (webauthnBusy) return;
+        if (mfaPendingToken) handleMfaCancel();
+        else if (mfaEnrollmentRequired) setMfaEnrollmentRequired(null);
+        return;
+      }
+      if (e.key !== "Tab") return;
+      // Focus trap: query the currently rendered overlay each time so we
+      // pick up the dynamic per-factor controls (TOTP input vs recovery
+      // input vs passkey button) without needing a ref on every panel.
+      const overlay = document.querySelector(".mfa-overlay");
+      if (!overlay) return;
+      const focusables = overlay.querySelectorAll(FOCUSABLE_SELECTOR);
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      // Restore focus to whatever the user was on before the modal opened,
+      // matching WAI-ARIA APG dialog guidance. Wrapped in try/catch since the
+      // node may no longer be in the DOM.
+      try { lastFocusedRef.current?.focus?.(); } catch { /* node gone */ }
+    };
+    // handleMfaCancel is stable enough — included in deps for lint cleanliness
+    // but the modalOpen toggle is the actual trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modalOpen, webauthnBusy]);
+
+  // SEC-004 a11y: backdrop click dismisses the MFA modals — mirrors the
+  // pattern in Settings.jsx PasswordConfirmModal so the dismiss UX is
+  // consistent across the app. Gated on `e.target === e.currentTarget` so
+  // clicks inside the dialog don't bubble up and accidentally close it.
+  function handleMfaBackdropClick(e) {
+    if (e.target !== e.currentTarget) return;
+    // Same guard as the Escape handler — never abort mid-passkey-verification.
+    if (webauthnBusy) return;
+    handleMfaCancel();
+  }
+  function handleEnrollmentBackdropClick(e) {
+    if (e.target !== e.currentTarget) return;
+    setMfaEnrollmentRequired(null);
+  }
+
+  async function handleOAuthCallback(provider, code) {
+    setOauthLoading(provider); setError("");
+    try {
+      const params = new URLSearchParams(location.search);
+      const returnedState = params.get("state");
+      const savedState = sessionStorage.getItem("oauth_state");
+      sessionStorage.removeItem("oauth_state");
+      if (!returnedState || returnedState !== savedState) {
+        throw new Error("OAuth state mismatch — possible CSRF attack. Please try again.");
+      }
+      // SEC-004: api.oauthCallback returns { data, headers } so we can read
+      // the X-MFA-Grace-Period-Days-Remaining header the backend sets when
+      // the workspace requires MFA and the user is within grace. Without
+      // this, OAuth users within the grace window never see the banner.
+      const raw = await api.oauthCallback(provider, code);
+      const data = raw.data;
+      const headers = raw.headers || {};
+      // Persist grace banner for the post-login dashboard (same as handleSubmit).
+      const remaining = headers["x-mfa-grace-period-days-remaining"];
+      const endsAt = headers["x-mfa-grace-ends-at"];
+      if (remaining) {
+        try {
+          sessionStorage.setItem("mfa_grace_banner", JSON.stringify({
+            daysRemaining: Number(remaining),
+            endsAt: endsAt || null,
+          }));
+        } catch { /* sessionStorage unavailable — banner is best-effort */ }
+      }
+      // SEC-004 (F9): defensive guard on the response shape.
+      if (!data?.user) throw new Error("OAuth login returned an unexpected response. Please try again.");
+      login(data.user);
+      window.history.replaceState({}, "", `${import.meta.env.BASE_URL}login`);
+    } catch (e) {
+      // SEC-004: Workspace requires MFA and the OAuth user is past grace.
+      // Surface the same dedicated panel as the password-login path
+      // (handleSubmit) instead of a raw error string — OAuth-only users
+      // have no password fallback and need actionable "contact your admin"
+      // guidance to unblock themselves.
+      if (e.body?.code === "MFA_ENROLLMENT_REQUIRED") {
+        setMfaEnrollmentRequired({
+          workspaceId: e.body.workspaceId,
+          workspaceName: e.body.workspaceName,
+        });
+      } else {
+        setError(e.message);
+      }
+      setOauthLoading(null);
+      window.history.replaceState({}, "", `${import.meta.env.BASE_URL}login`);
+    }
+  }
+
+  function handleGitHubLogin() {
+    if (!GITHUB_CLIENT_ID) { setError("GitHub OAuth not configured. Add VITE_GITHUB_CLIENT_ID to frontend/.env AND GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET to backend/.env"); return; }
+    const state = crypto.randomUUID(); sessionStorage.setItem("oauth_state", state);
+    const ru = encodeURIComponent(`${window.location.origin}${import.meta.env.BASE_URL.replace(/\/$/, '')}/login?provider=github`);
+    window.location.href = `https://github.com/login/oauth/authorize?client_id=${GITHUB_CLIENT_ID}&redirect_uri=${ru}&scope=user:email&state=${state}`;
+  }
+
+  function handleGoogleLogin() {
+    if (!GOOGLE_CLIENT_ID) { setError("Google OAuth not configured. Add VITE_GOOGLE_CLIENT_ID to frontend/.env AND GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET to backend/.env"); return; }
+    const state = crypto.randomUUID(); sessionStorage.setItem("oauth_state", state);
+    const ru = encodeURIComponent(`${window.location.origin}${import.meta.env.BASE_URL.replace(/\/$/, '')}/login?provider=google`);
+    const sc = encodeURIComponent("openid email profile");
+    window.location.href = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${GOOGLE_CLIENT_ID}&redirect_uri=${ru}&response_type=code&scope=${sc}&state=${state}&access_type=offline&prompt=select_account`;
+  }
+
+  async function handleSubmit(e) {
+    e.preventDefault(); setError(""); setSuccess("");
+    if (!email.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
+      setError("Please enter a valid email address."); return;
+    }
+    if (mode === "register") {
+      if (!name.trim()) { setError("Full name is required."); return; }
+      if (password.length < 8) { setError("Password must be at least 8 characters."); return; }
+      if (password !== confirmPassword) { setError("Passwords do not match."); return; }
+    }
+    setLoading(true);
+    try {
+      const body = mode === "login" ? { email, password } : { name, email, password };
+      let data;
+      let headers = {};
+      try {
+        if (mode === "login") {
+          // SEC-004: api.login returns { data, headers } so we can read
+          // the X-MFA-Grace-Period-Days-Remaining banner header. Register
+          // still returns the plain body shape.
+          const raw = await api.login(body);
+          data = raw.data;
+          headers = raw.headers || {};
+        } else {
+          data = await api.register(body);
+        }
+      } catch (fetchErr) {
+        // SEC-001: Handle unverified email on login attempt.
+        // req() attaches the parsed response body as error.body so we can
+        // inspect the structured `code` field from the backend (stable API
+        // contract) instead of fragile string matching on the error message.
+        if (fetchErr.body?.code === "EMAIL_NOT_VERIFIED") {
+          setVerifyEmail(fetchErr.body.email || email);
+        }
+        // SEC-004: Workspace requires MFA but the user has not enrolled and
+        // is past the grace window. Render a dedicated panel instead of the
+        // generic error — they need a workspace admin to either disable
+        // enforcement, extend grace, or enroll them out-of-band.
+        //
+        // Tag the rethrown error with `_mfaHandled = true` so the outer catch
+        // (line below) knows the dedicated panel covers the failure and
+        // skips the generic error banner. The previous approach threw a
+        // blank-message Error which relied on `setError("")` rendering as a
+        // no-op — fragile because any future "fallback to a non-empty
+        // message" change in the outer catch would silently start showing a
+        // spurious banner underneath the dedicated panel.
+        if (fetchErr.body?.code === "MFA_ENROLLMENT_REQUIRED") {
+          setMfaEnrollmentRequired({
+            workspaceId: fetchErr.body.workspaceId,
+            workspaceName: fetchErr.body.workspaceName,
+          });
+          fetchErr._mfaHandled = true;
+        }
+        throw fetchErr;
+      }
+      if (mode === "register") {
+        if (data.requiresVerification) {
+          setSuccess("Account created! Please check your email to verify your account before signing in.");
+          setVerifyEmail(email);
+        } else {
+          setSuccess("Account created! You can now sign in.");
+        }
+        setMode("login"); setPassword(""); setConfirmPassword("");
+      }
+      else if (data.mfaRequired && data.pendingToken) {
+        setMfaPendingToken(data.pendingToken);
+        // `methods` was added in the backend-webauthn lane. Pre-existing
+        // tokens issued before that change won't include it — default to
+        // TOTP only so the legacy flow still works.
+        const methods = data.methods || { totp: true, webauthn: false };
+        setMfaMethods(methods);
+        // Pick the strongest factor as the default: passkey if the user has
+        // one, otherwise TOTP. Recovery codes are opt-in via the toggle.
+        setMfaFactor(methods.webauthn ? "webauthn" : "totp");
+        setSuccess("Choose a verification method to finish signing in.");
+      } else {
+        // SEC-004: surface the grace-period banner via sessionStorage so
+        // post-login surfaces (dashboard, navbar) can render it. The header
+        // is only set when the workspace requires MFA AND the user is
+        // within grace — absent in every other login outcome.
+        const remaining = headers["x-mfa-grace-period-days-remaining"];
+        const endsAt = headers["x-mfa-grace-ends-at"];
+        if (remaining) {
+          try {
+            sessionStorage.setItem("mfa_grace_banner", JSON.stringify({
+              daysRemaining: Number(remaining),
+              endsAt: endsAt || null,
+            }));
+          } catch { /* sessionStorage unavailable — banner is best-effort */ }
+        }
+        // SEC-004 (F9): defensive guard on the response shape.
+        if (!data?.user) throw new Error("Login returned an unexpected response. Please try again.");
+        login(data.user);
+      }
+    } catch (e) {
+      // SEC-004: skip the generic banner when the MFA_ENROLLMENT_REQUIRED
+      // handler above already surfaced the dedicated panel. See `_mfaHandled`
+      // comment in the inner catch for rationale.
+      if (!e._mfaHandled) setError(e.message);
+    }
+    finally { setLoading(false); }
+  }
+
+  async function handleMfaVerify(e) {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
+    try {
+      // SEC-004 (F3): submit reads the per-factor buffer so a recovery code
+      // typed on the recovery tab can never be sent through the TOTP submit
+      // path (or vice versa) — preserves the wrong-tab-submission protection
+      // from the original shared-state design while keeping partial input
+      // across tab switches.
+      const code = mfaFactor === "recovery" ? mfaRecoveryCode : mfaTotpCode;
+      const data = await api.mfaVerify(mfaPendingToken, code);
+      // SEC-004 (F9): defensive guard on the response shape. The backend
+      // contract is `{ user }` on success (see `backend/src/routes/auth.js`
+      // `POST /mfa/verify`) but a partial payload from a future change
+      // would currently call `login(undefined)` and corrupt AuthContext.
+      // Surface a clear error instead.
+      if (!data?.user) throw new Error("MFA verification returned an unexpected response. Please try again.");
+      login(data.user);
+    } catch (e) { setError(e.message); }
+    finally { setLoading(false); }
+  }
+
+  /**
+   * Passkey verification during the login challenge. Calls the backend for
+   * options, hands them to `@simplewebauthn/browser`, then submits the
+   * assertion. On success the backend sets the auth cookie with
+   * `amr: ["pwd","mfa"]` and we proceed to the dashboard.
+   */
+  async function handleMfaWebauthn() {
+    setError("");
+    setWebauthnBusy(true);
+    try {
+      const { startAuthentication } = await import("@simplewebauthn/browser");
+      const { options, challengeToken } = await api.webauthnAuthOptions(mfaPendingToken);
+      // SimpleWebAuthn v11 takes `{ optionsJSON }`; v10 takes the options
+      // object directly. Try v11 first, fall back to v10 on TypeError.
+      let assertion;
+      try {
+        assertion = await startAuthentication({ optionsJSON: options });
+      } catch (err) {
+        if (err?.name === "TypeError") assertion = await startAuthentication(options);
+        else throw err;
+      }
+      const data = await api.webauthnAuthVerify(challengeToken, assertion);
+      // SEC-004 (F9): defensive guard — same rationale as handleMfaVerify.
+      if (!data?.user) throw new Error("Passkey verification returned an unexpected response. Please try again.");
+      login(data.user);
+    } catch (e) {
+      const msg = e?.name === "NotAllowedError"
+        ? "Passkey verification was cancelled or denied by the browser."
+        : (e.message || "Passkey verification failed.");
+      setError(msg);
+    } finally {
+      setWebauthnBusy(false);
+    }
+  }
+
+  function handleMfaCancel() {
+    setMfaPendingToken("");
+    setMfaTotpCode("");
+    setMfaRecoveryCode("");
+    setMfaMethods({ totp: false, webauthn: false });
+    setMfaFactor("totp");
+    setSuccess("");
+    setError("");
+  }
+
+  const strength = (() => {
+    if (!password || mode === "login") return null;
+    let s = 0;
+    if (password.length >= 8) s++; if (password.length >= 12) s++;
+    if (/[A-Z]/.test(password)) s++; if (/[0-9]/.test(password)) s++;
+    if (/[^A-Za-z0-9]/.test(password)) s++;
+    if (s <= 1) return { label: "Weak", color: "#f87171", pct: "20%" };
+    if (s <= 2) return { label: "Fair", color: "#fb923c", pct: "45%" };
+    if (s <= 3) return { label: "Good", color: "#facc15", pct: "70%" };
+    return { label: "Strong", color: "#4ade80", pct: "100%" };
+  })();
+
+  return (
+    <>
+      {/* Styles loaded from styles/pages/login.css */}
+
+      <div className={`lp-root${mounted?" on":""}`}>
+        {/* SEC-004: MFA challenge overlay — factor picker + per-factor UI. */}
+        {mfaPendingToken && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="mfa-modal-title"
+            className="mfa-overlay"
+            onClick={handleMfaBackdropClick}
+          >
+            <form
+              onSubmit={handleMfaVerify}
+              className="card mfa-modal"
+            >
+              <div>
+                <h3 id="mfa-modal-title" className="mfa-modal__title">Two-factor verification</h3>
+                <p className="text-sub mfa-modal__subtitle">
+                  Confirm your identity to finish signing in.
+                </p>
+              </div>
+
+              {/* Factor picker — only render when multiple factors exist. */}
+              {(mfaMethods.totp || mfaMethods.webauthn) && (
+                <div role="tablist" aria-label="Verification method" className="mfa-tablist">
+                  {mfaMethods.webauthn && (
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={mfaFactor === "webauthn"}
+                      className={`btn btn-sm ${mfaFactor === "webauthn" ? "btn-primary" : "btn-ghost"}`}
+                      onClick={() => { setMfaFactor("webauthn"); setError(""); }}
+                    >
+                      Passkey
+                    </button>
+                  )}
+                  {mfaMethods.totp && (
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={mfaFactor === "totp"}
+                      className={`btn btn-sm ${mfaFactor === "totp" ? "btn-primary" : "btn-ghost"}`}
+                      onClick={() => { setMfaFactor("totp"); setError(""); }}
+                    >
+                      Authenticator
+                    </button>
+                  )}
+                  {mfaMethods.totp && (
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={mfaFactor === "recovery"}
+                      className={`btn btn-sm ${mfaFactor === "recovery" ? "btn-primary" : "btn-ghost"}`}
+                      onClick={() => { setMfaFactor("recovery"); setError(""); }}
+                    >
+                      Recovery code
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {error && (
+                <div className="lp-alert lp-aerr" role="alert">
+                  {error}
+                </div>
+              )}
+
+              {/* Passkey panel */}
+              {mfaFactor === "webauthn" && (
+                <>
+                  <p className="text-sub mfa-panel__hint">
+                    Use a registered passkey (security key, Touch ID, Windows Hello, etc.).
+                  </p>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={handleMfaWebauthn}
+                    disabled={webauthnBusy}
+                  >
+                    {webauthnBusy ? <Spinner/> : null}
+                    {webauthnBusy ? "Waiting for passkey…" : "Use passkey"}
+                  </button>
+                </>
+              )}
+
+              {/* TOTP panel */}
+              {mfaFactor === "totp" && (
+                <>
+                  <label className="text-sm font-semi mfa-label" htmlFor="mfa-totp-code">
+                    6-digit code from your authenticator app
+                    <input
+                      id="mfa-totp-code"
+                      className="input mfa-code-input"
+                      type="text"
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                      maxLength={6}
+                      value={mfaTotpCode}
+                      onChange={e => setMfaTotpCode(e.target.value.replace(/[^\d]/g, ""))}
+                      placeholder="123456"
+                      autoFocus
+                    />
+                  </label>
+                  <button
+                    type="submit"
+                    className="btn btn-primary"
+                    disabled={loading || mfaTotpCode.length < 6}
+                  >
+                    {loading ? <Spinner/> : null}
+                    {loading ? "Verifying…" : "Verify"}
+                  </button>
+                </>
+              )}
+
+              {/* Recovery-code panel */}
+              {mfaFactor === "recovery" && (
+                <>
+                  <label className="text-sm font-semi mfa-label" htmlFor="mfa-recovery-code">
+                    Recovery code
+                    <input
+                      id="mfa-recovery-code"
+                      className="input mfa-recovery-input"
+                      type="text"
+                      autoComplete="off"
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      maxLength={16}
+                      value={mfaRecoveryCode}
+                      // SEC-004: lowercase as the user types. Recovery codes
+                      // are minted as lowercase hex; mobile auto-capitalize
+                      // would silently produce a wrong-case input. Backend
+                      // also normalises, but doing it here gives immediate
+                      // visual feedback that the input matches the format
+                      // the user was originally shown.
+                      onChange={e => setMfaRecoveryCode(e.target.value.trim().toLowerCase())}
+                      placeholder="abcd1234"
+                      autoFocus
+                    />
+                    <span className="text-xs text-sub mfa-recovery-hint">
+                      Each recovery code can be used once.
+                    </span>
+                  </label>
+                  <button
+                    type="submit"
+                    className="btn btn-primary"
+                    disabled={loading || !mfaRecoveryCode.trim()}
+                  >
+                    {loading ? <Spinner/> : null}
+                    {loading ? "Verifying…" : "Verify"}
+                  </button>
+                </>
+              )}
+
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={handleMfaCancel}
+                disabled={loading || webauthnBusy}
+              >
+                Cancel and sign in again
+              </button>
+            </form>
+          </div>
+        )}
+
+        {/* SEC-004: Workspace requires MFA but the user has no factor enrolled
+            and is past grace. They cannot reach Settings without a session, so
+            we surface a contact-admin panel instead of letting them retry. */}
+        {mfaEnrollmentRequired && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="mfa-blocked-title"
+            className="mfa-overlay"
+            onClick={handleEnrollmentBackdropClick}
+          >
+            <div className="card mfa-blocked">
+              <h3 id="mfa-blocked-title" className="mfa-blocked__title">MFA enrollment required</h3>
+              <p className="text-sub mfa-blocked__body">
+                Your workspace
+                {mfaEnrollmentRequired.workspaceName ? <> <strong>{mfaEnrollmentRequired.workspaceName}</strong></> : null}
+                {" "}requires multi-factor authentication, and your grace period has ended.
+              </p>
+              <p className="text-sub mfa-blocked__detail">
+                Contact a workspace administrator to enroll a second factor or
+                extend the grace window. You will not be able to sign in until
+                this is resolved.
+              </p>
+              <button
+                className="btn btn-ghost"
+                onClick={() => setMfaEnrollmentRequired(null)}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* LEFT */}
+        {/* SEC-004 a11y (F7): `inert` removes the background panels from the
+            tab order + screen reader tree while a modal is open, so keyboard /
+            AT users cannot reach hidden form fields behind the overlay. */}
+        <div className="lp-left" {...(modalOpen ? { inert: "" } : {})}>
+          <div className="lp-grid"/>
+          <div className="lp-orb lp-orb-1"/><div className="lp-orb lp-orb-2"/><div className="lp-orb lp-orb-3"/>
+          <div className="lp-brand flex-between">
+            <AppLogo size={36} variant="full" color="#f1f5f9" />
+            <a href={`${import.meta.env.BASE_URL}docs/`} target="_blank" rel="noopener noreferrer" style={{fontSize:"0.78rem",color:"#64748b",textDecoration:"none",display:"flex",alignItems:"center",gap:5,transition:"color 0.15s"}} onMouseEnter={e=>{e.currentTarget.style.color="#a5b4fc"}} onMouseLeave={e=>{e.currentTarget.style.color="#64748b"}}>
+              Docs
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+            </a>
+          </div>
+
+          <div className="lp-hero">
+            <div className="lp-eyebrow">
+              <div className="lp-eyebrow-dot"/>
+              <span>Autonomous QA Platform</span>
+            </div>
+            <h1 className="lp-headline">Ship faster.<br/>Break <span className="lp-accent">nothing.</span></h1>
+            <p className="lp-subline">AI Powered QA Platform writes, runs, and heals your test suite — so your team can focus on building, not debugging.</p>
+            <div className="lp-features">
+              {FEATURES.map((f,i) => (
+                <div className="lp-feature" key={i}>
+                  <div className="lp-ficon">{f.icon}</div>
+                  <div><p className="lp-ftitle">{f.title}</p><p className="lp-fdesc">{f.desc}</p></div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="lp-testi"
+            onMouseEnter={() => setTestiPaused(true)}
+            onMouseLeave={() => setTestiPaused(false)}
+            role="region"
+            aria-label="Testimonials"
+            aria-live="polite"
+          >
+            <p className="lp-tquote">"{TESTIMONIALS[tIdx].quote}"</p>
+            <div className="lp-tauthor">
+              <div className="lp-tavatar">{TESTIMONIALS[tIdx].name.charAt(0)}</div>
+              <div><div className="lp-tname">{TESTIMONIALS[tIdx].name}</div><div className="lp-trole">{TESTIMONIALS[tIdx].role}</div></div>
+            </div>
+            <div className="lp-tdots">{TESTIMONIALS.map((_,i)=><div key={i} className={`lp-tdot${i===tIdx?" on":""}`}/>)}</div>
+          </div>
+        </div>
+
+        {/* RIGHT */}
+        <div className="lp-right" {...(modalOpen ? { inert: "" } : {})}>
+          <div className="lp-fw">
+            <div className="lp-fh">
+              <h2 className="lp-ftit">{mode==="login"?"Welcome back":"Create account"}</h2>
+              <p className="lp-fsub">{mode==="login"?"Sign in to continue to AI Powered QA Platform":"Start your free workspace today"}</p>
+            </div>
+
+            <div className="lp-oauth">
+              <button className="lp-ob" onClick={handleGitHubLogin} disabled={!!loading||!!oauthLoading} aria-label="GitHub">
+                {oauthLoading==="github"?<Spinner/>:<GitHubIcon/>} GitHub
+              </button>
+              <button className="lp-ob" onClick={handleGoogleLogin} disabled={!!loading||!!oauthLoading} aria-label="Google">
+                {oauthLoading==="google"?<Spinner/>:<GoogleIcon/>} Google
+              </button>
+            </div>
+
+            <div className="lp-div"><div className="lp-dline"/><span>or with email</span><div className="lp-dline"/></div>
+
+            {error && (
+              <div className="lp-alert lp-aerr" role="alert">
+                <svg viewBox="0 0 20 20" width="15" height="15" fill="currentColor" style={{flexShrink:0,marginTop:1}}><path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clipRule="evenodd"/></svg>
+                {error}
+              </div>
+            )}
+            {success && (
+              <div className="lp-alert lp-aok" role="status">
+                <svg viewBox="0 0 20 20" width="15" height="15" fill="currentColor" style={{flexShrink:0,marginTop:1}}><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd"/></svg>
+                {success}
+              </div>
+            )}
+
+            {/* SEC-001: Resend verification email prompt */}
+            {verifyEmail && (
+              <div className="lp-alert" role="status" style={{background:"#eff6ff",border:"1px solid #bfdbfe",color:"#1e40af",display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                <svg viewBox="0 0 20 20" width="15" height="15" fill="currentColor" style={{flexShrink:0}}><path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd"/></svg>
+                <span style={{flex:1}}>Didn't receive the email? Check your spam folder or</span>
+                <button type="button" onClick={handleResendVerification} disabled={resending} style={{background:"#3b82f6",color:"#fff",border:"none",borderRadius:6,padding:"5px 12px",fontSize:"0.78rem",fontWeight:600,cursor:"pointer",opacity:resending?0.6:1}}>
+                  {resending ? "Sending…" : "Resend verification email"}
+                </button>
+              </div>
+            )}
+
+            <form onSubmit={handleSubmit} noValidate>
+              {mode==="register" && (
+                <div className="lp-field fe">
+                  <div className="lp-lrow"><label className="lp-lbl" htmlFor="reg-name">Full name</label></div>
+                  <input id="reg-name" type="text" className="lp-in" placeholder="Ada Lovelace" value={name} onChange={e=>setName(e.target.value)} autoComplete="name" required disabled={loading}/>
+                </div>
+              )}
+              <div className="lp-field">
+                <div className="lp-lrow"><label className="lp-lbl" htmlFor="login-email">Email address</label></div>
+                <input id="login-email" type="email" className="lp-in" placeholder="you@company.com" value={email} onChange={e=>setEmail(e.target.value)} autoComplete="username" required disabled={loading}/>
+              </div>
+              <div className="lp-field">
+                <div className="lp-lrow">
+                  <label className="lp-lbl" htmlFor="login-pw">Password</label>
+                  {mode==="login" && <Link to="/forgot-password" className="lp-forgot">Forgot password?</Link>}
+                </div>
+                <div className="lp-iw">
+                  <input id="login-pw" type={showPassword?"text":"password"} className={`lp-in pi`} placeholder={mode==="register"?"Min. 8 characters":"••••••••"} value={password} onChange={e=>setPassword(e.target.value)} autoComplete={mode==="login"?"current-password":"new-password"} required disabled={loading} minLength={mode==="register"?8:undefined}/>
+                  <button type="button" className="lp-eye" onClick={()=>setShowPassword(v=>!v)} aria-label={showPassword?"Hide password":"Show password"}>
+                    {showPassword
+                      ? <svg viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>
+                      : <svg viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+                    }
+                  </button>
+                </div>
+                {strength && (
+                  <div className="lp-str">
+                    <div className="lp-strtrack"><div className="lp-strfill" style={{width:strength.pct,background:strength.color}}/></div>
+                    <span className="lp-strlbl" style={{color:strength.color}}>{strength.label}</span>
+                  </div>
+                )}
+              </div>
+              {mode==="register" && (
+                <div className="lp-field fe">
+                  <div className="lp-lrow"><label className="lp-lbl" htmlFor="reg-confirm-pw">Confirm password</label></div>
+                  <input id="reg-confirm-pw" type={showPassword?"text":"password"} className="lp-in" placeholder="Re-enter your password" value={confirmPassword} onChange={e=>setConfirmPassword(e.target.value)} autoComplete="new-password" required disabled={loading}/>
+                  {confirmPassword && password !== confirmPassword && (
+                    <div style={{fontSize:"0.75rem",color:"#f87171",marginTop:6}}>Passwords do not match.</div>
+                  )}
+                </div>
+              )}
+
+              <button type="submit" className="lp-sub" disabled={loading||!!oauthLoading||(mode==="register"&&password!==confirmPassword)}>
+                {loading && <Spinner/>}
+                {loading?(mode==="login"?"Signing in…":"Creating account…"):(mode==="login"?"Sign in to AI Powered QA Platform":"Create account")}
+              </button>
+            </form>
+
+            <p className="lp-sw">
+              {mode==="login"
+                ? (<>Don't have an account?{" "}<button className="lp-swb" onClick={()=>{setMode("register");setError("");setSuccess("");setPassword("");setConfirmPassword("");}}>Create account</button></>)
+                : (<>Already have an account?{" "}<button className="lp-swb" onClick={()=>{setMode("login");setError("");setSuccess("");setPassword("");setConfirmPassword("");}}>Sign in</button></>)
+              }
+            </p>
+            <p className="lp-tos">By continuing you agree to our <a href={`${import.meta.env.BASE_URL}docs/`} target="_blank" rel="noopener noreferrer">Terms of Service</a> and <a href={`${import.meta.env.BASE_URL}docs/`} target="_blank" rel="noopener noreferrer">Privacy Policy</a>.</p>
+            <p className="lp-tos" style={{marginTop:8}}><a href={`${import.meta.env.BASE_URL}docs/`} target="_blank" rel="noopener noreferrer">Documentation</a></p>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}

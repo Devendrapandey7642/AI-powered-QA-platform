@@ -1,0 +1,606 @@
+/**
+ * @module routes/dashboard
+ * @description Dashboard analytics endpoint. Mounted at `/api/v1` (INF-005).
+ *
+ * ### Endpoints
+ * | Method | Path                 | Description                                                |
+ * |--------|----------------------|------------------------------------------------------------|
+ * | `GET`  | `/api/v1/dashboard`  | Pass rate, defects, flaky tests, MTTR, growth, and more    |
+ */
+
+import { Router } from "express";
+import * as projectRepo from "../database/repositories/projectRepo.js";
+import * as testRepo from "../database/repositories/testRepo.js";
+import * as runRepo from "../database/repositories/runRepo.js";
+import * as activityRepo from "../database/repositories/activityRepo.js";
+import * as healingRepo from "../database/repositories/healingRepo.js";
+import * as accessibilityViolationRepo from "../database/repositories/accessibilityViolationRepo.js";
+import * as environmentRepo from "../database/repositories/environmentRepo.js";
+import { classifyFailure } from "../pipeline/feedbackLoop.js";
+import { getTopFlakyTests } from "../utils/flakyDetector.js";
+import { getQueueStats, isQueueAvailable, runQueue } from "../queue.js";
+import { formatLogLine } from "../utils/logFormatter.js";
+import { getEvalTrend, getEvalRunCases } from "../eval/evalPersistence.js";
+import { loadGoldens } from "../eval/pipelineEval.js";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// AUTO-022 — golden-set on-disk source-of-truth for `expected` Playwright
+// code. The drill-down route reads `actual` from `metric_samples` and layers
+// `expected` in from these JSON files so the file stays the canonical
+// definition (eval-baseline.json + the case JSONs are reviewed together in
+// PRs; the DB row only captures what the harness emitted at run time).
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const EVAL_GOLDEN_DIR = path.resolve(__dirname, "..", "..", "tests", "fixtures", "eval-goldens");
+
+const router = Router();
+
+router.get("/dashboard", async (req, res) => {
+  // Express 4 does NOT auto-catch rejected promises from async handlers, so
+  // any synchronous throw (e.g. a repo call) would otherwise hang the request
+  // until the client times out. Wrap the entire body so failures surface as
+  // a 500 instead. Mirrors the pattern used by other async routes (e.g.
+  // routes/auth.js).
+  try {
+  // ACL-001: Scope dashboard data to the user's workspace.
+  // Projects are filtered by workspaceId; runs and tests are filtered by
+  // the set of project IDs that belong to this workspace.
+  const projects = projectRepo.getAll(req.workspaceId);
+  const projectIds = projects.map(p => p.id);
+
+  // Scope queries to the user's workspace project IDs at the SQL layer
+  // so multi-tenant deployments don't load data from other workspaces.
+  const runs = runRepo.getWithResultsByProjectIds(projectIds);
+  const tests = testRepo.getAllByProjectIds(projectIds);
+  // Only fetch activity types needed for dashboard counters (not all activities)
+  const generationActivities = activityRepo.getByTypes(["test.create", "test.generate"], {
+    workspaceId: req.workspaceId,
+  });
+  const projectsById = {};
+  for (const p of projects) projectsById[p.id] = p;
+
+  // ── Pass rate (last 10 completed test runs) ─────────────────────────────
+  const completedTestRuns = runs
+    .filter((r) => (r.type === "test_run" || r.type === "run") && r.status === "completed")
+    .sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt))
+    .slice(0, 10);
+
+  const passRate =
+    completedTestRuns.length
+      ? Math.round(
+          (completedTestRuns.reduce((s, r) => s + (r.passed || 0), 0) /
+            completedTestRuns.reduce((s, r) => s + (r.total || 1), 0)) *
+            100
+        )
+      : null;
+
+  // ── Chart history — last 20 test runs with results (chronological) ──────
+  const history = runs
+    .filter((r) => (r.type === "test_run" || r.type === "run") && r.passed != null)
+    .sort((a, b) => new Date(a.startedAt) - new Date(b.startedAt))
+    .slice(-20)
+    .map((r) => ({ passed: r.passed || 0, failed: r.failed || 0, total: r.total || 0, date: r.startedAt }));
+
+  // ── Recent runs — ALL statuses so failures/aborts are visible ───────────
+  const recentRuns = runs
+    .sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt))
+    .slice(0, 8)
+    .map((r) => {
+      const p = projectsById[r.projectId];
+      return { id: r.id, projectId: r.projectId, projectName: p?.name || null, type: r.type, status: r.status, startedAt: r.startedAt, passed: r.passed, failed: r.failed, total: r.total };
+    });
+
+  // ── Run status distribution ─────────────────────────────────────────────
+  const runsByStatus = { completed: 0, completed_empty: 0, failed: 0, aborted: 0, running: 0 };
+  for (const r of runs) { if (r.status in runsByStatus) runsByStatus[r.status]++; }
+
+  // ── Test review pipeline ────────────────────────────────────────────────
+  const testsByReview = { draft: 0, approved: 0, rejected: 0 };
+  for (const t of tests) { const s = t.reviewStatus || "draft"; if (s in testsByReview) testsByReview[s]++; }
+
+  // ── Tests created / generated (today & this week) ───────────────────────
+  // Each AI generation logs TWO test.generate activities: one at start
+  // (status "running") and one on completion (status "completed" / default).
+  // Only count completed activities to avoid double-counting.
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+  const weekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay()).toISOString();
+  let testsCreatedToday = 0, testsCreatedThisWeek = 0, testsGeneratedTotal = 0;
+  for (const a of generationActivities) {
+    // Skip "running" status entries to avoid double-counting start + completion
+    if (a.status === "running") continue;
+    testsGeneratedTotal++;
+    if (a.createdAt >= todayStart) testsCreatedToday++;
+    if (a.createdAt >= weekStart) testsCreatedThisWeek++;
+  }
+
+  // ── Tests auto-fixed (feedback loop + self-healing) ─────────────────────
+  let testsAutoFixed = 0;
+  for (const r of runs) { if (r.feedbackLoop?.improved) testsAutoFixed += r.feedbackLoop.improved; }
+  const testIds = tests.map((t) => t.id);
+  const healingEntries = healingRepo.countByTestIds(testIds);
+  const healingSuccesses = healingRepo.countSuccessesByTestIds(testIds);
+
+  // ── Average run duration (completed test runs) ──────────────────────────
+  const durations = completedTestRuns.filter((r) => r.duration > 0).map((r) => r.duration);
+  const avgRunDurationMs = durations.length ? Math.round(durations.reduce((s, d) => s + d, 0) / durations.length) : null;
+
+  // ── Defect / failure category breakdown (across all test run results) ───
+  // BOT_BLOCK is surfaced as its own bucket so anti-bot interstitial failures
+  // (CAPTCHA / `/sorry/` / "unusual traffic") don't get folded into UNKNOWN
+  // and lose the honest "site refused automation" signal in the dashboard.
+  const defectBreakdown = { BOT_BLOCK: 0, SELECTOR_ISSUE: 0, NAVIGATION_FAIL: 0, TIMEOUT: 0, ASSERTION_FAIL: 0, UNKNOWN: 0 };
+  const testResultStatuses = {};   // testId → Set<"passed"|"failed">
+  const testRunResults = runs.filter((r) => (r.type === "test_run" || r.type === "run") && r.results?.length);
+  for (const r of testRunResults) {
+    for (const result of r.results) {
+      if (!testResultStatuses[result.testId]) testResultStatuses[result.testId] = new Set();
+      if (result.status) testResultStatuses[result.testId].add(result.status);
+      if (result.status === "failed" && (result.error || result.url)) {
+        // Pass `result.url` so the classifier can match anti-bot URLs even
+        // when the error text is just a generic locator timeout. See
+        // `classifyFailure` jsdoc in `backend/src/pipeline/feedbackLoop.js`.
+        const cat = classifyFailure(result.error, { finalUrl: result.url });
+        // Don't inflate the UNKNOWN bucket with errorless-but-URL'd failed
+        // rows that pre-PR were silently excluded. We widened the guard
+        // above to `result.url` so BOT_BLOCK URL-only detection participates
+        // (the whole point — a failed run that lands on `/sorry/` has the
+        // URL but no error text), but a failed result with no error AND a
+        // non-bot URL still classifies as UNKNOWN — and counting those
+        // would change the defect-breakdown denominator on every
+        // dashboard since this PR shipped, without anything actionable to
+        // show for it. Skip them; the original `result.error`-only guard
+        // already dropped them.
+        if (!result.error && cat === "UNKNOWN") continue;
+        if (cat in defectBreakdown) defectBreakdown[cat]++;
+        else defectBreakdown.UNKNOWN++;
+      }
+    }
+  }
+
+  // ── Flaky test count (tests with both "passed" and "failed" across runs) ─
+  let flakyTestCount = 0;
+  for (const statuses of Object.values(testResultStatuses)) {
+    if (statuses.has("passed") && statuses.has("failed")) flakyTestCount++;
+  }
+
+  // ── Test growth — cumulative test count per week (last 8 weeks) ─────────
+  const GROWTH_WEEKS = 8;
+  const weekMs = 7 * 24 * 60 * 60 * 1000;
+  const growthStart = new Date(now.getTime() - GROWTH_WEEKS * weekMs);
+  const weekBuckets = {};
+  for (let i = 0; i < GROWTH_WEEKS; i++) {
+    const d = new Date(growthStart.getTime() + i * weekMs);
+    const key = d.toISOString().slice(0, 10);
+    weekBuckets[key] = 0;
+  }
+  for (const a of generationActivities) {
+    if (a.status === "running") continue; // skip start entries (same as above)
+    if (a.createdAt < growthStart.toISOString()) continue;
+    const aTime = new Date(a.createdAt).getTime();
+    for (let i = GROWTH_WEEKS - 1; i >= 0; i--) {
+      const bucketStart = growthStart.getTime() + i * weekMs;
+      if (aTime >= bucketStart) {
+        const key = new Date(bucketStart).toISOString().slice(0, 10);
+        weekBuckets[key] = (weekBuckets[key] || 0) + 1;
+        break;
+      }
+    }
+  }
+  const testGrowth = [];
+  let cumulative = tests.length;
+  const sortedKeys = Object.keys(weekBuckets).sort();
+  const totalRecent = sortedKeys.reduce((s, k) => s + weekBuckets[k], 0);
+  cumulative = Math.max(0, tests.length - totalRecent);
+  for (const key of sortedKeys) {
+    cumulative += weekBuckets[key];
+    testGrowth.push({ week: key, count: cumulative });
+  }
+
+  // ── MTTR — mean time to recovery (failed → passed) ─────────────────────
+  const chronologicalRuns = runs
+    .filter((r) => (r.type === "test_run" || r.type === "run") && r.results?.length && r.startedAt)
+    .sort((a, b) => new Date(a.startedAt) - new Date(b.startedAt));
+  const lastFailTime = {};
+  const recoveryDeltas = [];
+  for (const r of chronologicalRuns) {
+    for (const result of r.results) {
+      if (result.status === "failed") {
+        lastFailTime[result.testId] = r.startedAt;
+      } else if (result.status === "passed" && lastFailTime[result.testId]) {
+        const delta = new Date(r.startedAt) - new Date(lastFailTime[result.testId]);
+        if (delta > 0) recoveryDeltas.push(delta);
+        delete lastFailTime[result.testId];
+      }
+    }
+  }
+  const mttrMs = recoveryDeltas.length
+    ? Math.round(recoveryDeltas.reduce((s, d) => s + d, 0) / recoveryDeltas.length)
+    : null;
+
+  // ── DIF-011: Test density per URL for coverage heatmap ────────────────────
+  // Counts approved tests per sourceUrl so the SiteGraph can colour nodes
+  // by coverage density: 0 = red, 1–2 = amber, 3+ = green.
+  const testsByUrl = {};
+  for (const t of tests) {
+    if (t.reviewStatus !== "approved" || !t.sourceUrl) continue;
+    testsByUrl[t.sourceUrl] = (testsByUrl[t.sourceUrl] || 0) + 1;
+  }
+
+  // DIF-004: Top flaky tests — persisted flakyScore from the flaky detector
+  const topFlakyTests = getTopFlakyTests(projectIds, 10);
+  // ── Top accessibility offenders (AUTO-016b) ─────────────────────────────
+  // Group crawl/generate runs by project once, then issue a single
+  // `countByRunIds` query for all the recent run IDs across all projects.
+  // Avoids the per-project filter+sort+N+1 SELECT pattern.
+  const crawlGenRunsByProject = {};
+  for (const r of runs) {
+    if (r.type !== "crawl" && r.type !== "generate") continue;
+    (crawlGenRunsByProject[r.projectId] ??= []).push(r);
+  }
+  const projectRunIds = {};
+  const allRecentRunIds = [];
+  for (const projectId of projectIds) {
+    const projectRuns = crawlGenRunsByProject[projectId];
+    if (!projectRuns?.length) continue;
+    const runIds = projectRuns
+      .sort((a, b) => new Date(b.startedAt || 0) - new Date(a.startedAt || 0))
+      .slice(0, 5)
+      .map((run) => run.id);
+    projectRunIds[projectId] = runIds;
+    allRecentRunIds.push(...runIds);
+  }
+  const violationCountsByRunId = accessibilityViolationRepo.countByRunIds(allRecentRunIds);
+  // Build minimal {projectId, violations} tuples, sort+slice, *then* attach
+  // project names so we don't retain strings for projects that won't make the cut.
+  const offenderCounts = [];
+  for (const projectId of projectIds) {
+    const runIds = projectRunIds[projectId];
+    if (!runIds) continue;
+    let count = 0;
+    for (const runId of runIds) count += violationCountsByRunId[runId] || 0;
+    if (count > 0) offenderCounts.push({ projectId, violations: count });
+  }
+  offenderCounts.sort((a, b) => b.violations - a.violations);
+  const topAccessibilityOffenders = offenderCounts.slice(0, 5).map((o) => ({
+    projectId: o.projectId,
+    projectName: projectsById[o.projectId]?.name || "Unknown project",
+    violations: o.violations,
+  }));
+
+  // ── DIF-012: per-environment pass rate + last green run ──────────────────
+  // Aggregate completed test runs bucketed by `runs.environmentId`. Runs
+  // without an environmentId fall into a synthetic "default" bucket so
+  // projects that have never picked a non-default target still surface
+  // alongside multi-env ones. We only compute this when at least one
+  // environment exists in the workspace — keeps the payload identical for
+  // users who haven't adopted the feature.
+  //
+  // Batched in one SQL round-trip via `listByProjectIds` (replaces the prior
+  // per-project N+1 loop) and bucketed locally below.
+  const allEnvironments = environmentRepo.listByProjectIds(projectIds);
+  const environmentsByProject = {};
+  for (const env of allEnvironments) {
+    (environmentsByProject[env.projectId] ??= []).push(env);
+  }
+  const workspaceHasEnvironments = allEnvironments.length > 0;
+
+  // 90-day window for the per-env pass-rate aggregation. Other dashboard
+  // metrics use a last-N-runs window (passRate at line 42-55: 10 runs),
+  // but per-env buckets are sparser — a quiet env might only see a handful
+  // of runs a month, so a time window matches user intuition better than
+  // a run-count window. 90 days balances "recent enough to be relevant"
+  // against "enough data points for the green-rate signal to be stable".
+  const ENV_AGGREGATION_WINDOW_DAYS = 90;
+  const envWindowCutoff = Date.now() - ENV_AGGREGATION_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+
+  let environmentPassRates = null;
+  if (workspaceHasEnvironments) {
+    // bucketKey = `${projectId}::${environmentId || "default"}`. Pre-build a
+    // map of bucket → { name, baseUrl } so we can resolve names without a
+    // second pass over the env list. Synthetic "default" buckets carry the
+    // project's own URL so the UI can still show "Last green vs prod.example.com".
+    const buckets = new Map();
+    for (const p of projects) {
+      const defaultKey = `${p.id}::default`;
+      buckets.set(defaultKey, {
+        projectId: p.id,
+        projectName: p.name,
+        environmentId: null,
+        environmentName: "default",
+        baseUrl: p.url || null,
+        total: 0,
+        passed: 0,
+        failed: 0,
+        lastGreenRunAt: null,
+        lastGreenRunId: null,
+      });
+      for (const env of environmentsByProject[p.id] || []) {
+        buckets.set(`${p.id}::${env.id}`, {
+          projectId: p.id,
+          projectName: p.name,
+          environmentId: env.id,
+          environmentName: env.name,
+          baseUrl: env.baseUrl,
+          total: 0,
+          passed: 0,
+          failed: 0,
+          lastGreenRunAt: null,
+          lastGreenRunId: null,
+        });
+      }
+    }
+    for (const r of runs) {
+      if (r.type !== "test_run" && r.type !== "run") continue;
+      if (r.status !== "completed") continue;
+      if (!r.startedAt) continue;
+      const key = `${r.projectId}::${r.environmentId || "default"}`;
+      const b = buckets.get(key);
+      if (!b) continue; // run targeted a now-deleted env — skip silently
+      const inWindow = new Date(r.startedAt).getTime() >= envWindowCutoff;
+      // Time-window the pass-rate denominator so a project's noisy first
+      // year doesn't permanently anchor the displayed rate.
+      if (inWindow) {
+        b.total += r.total || 0;
+        b.passed += r.passed || 0;
+        b.failed += r.failed || 0;
+      }
+      // "Last green run" = most recent completed test run where every test
+      // passed (failed === 0) and at least one test ran. Mirrors how
+      // `passRate === 100%` is conventionally interpreted in the UI.
+      // Unbounded by the window: a "most recent green" lookup is meaningful
+      // even when the last green run is older than 90 days (low-cadence
+      // envs like DR / quarterly-release projects). The UI shows the
+      // timestamp so users can judge staleness themselves.
+      const isGreen = (r.failed || 0) === 0 && (r.passed || 0) > 0;
+      if (isGreen) {
+        const ts = r.startedAt;
+        if (!b.lastGreenRunAt || new Date(ts) > new Date(b.lastGreenRunAt)) {
+          b.lastGreenRunAt = ts;
+          b.lastGreenRunId = r.id;
+        }
+      }
+    }
+    environmentPassRates = Array.from(buckets.values())
+      // Hide buckets that never received a run so the table doesn't get noisy
+      // with synthetic defaults on freshly-created multi-env projects.
+      .filter((b) => b.total > 0 || b.environmentId)
+      .map((b) => ({
+        ...b,
+        passRate: b.total > 0 ? Math.round((b.passed / b.total) * 100) : null,
+        windowDays: ENV_AGGREGATION_WINDOW_DAYS,
+      }));
+  }
+
+  // ── AUTO-008: Distributed worker pool visibility ───────────────────────
+  // When BullMQ/Redis is available, surface live queue depth + per-worker
+  // health so operators can see whether the pool is keeping up. Falls back
+  // to a `single-process` stub (zeroed counters) when Redis is absent so the
+  // frontend never has to special-case missing fields.
+  let workerPool = {
+    mode: "single-process",
+    queue: { waiting: 0, active: 0, completed: 0, delayed: 0, failed: 0 },
+    activeWorkers: 0,
+    idleWorkers: 0,
+    totalWorkers: 0,
+  };
+  if (isQueueAvailable()) {
+    try {
+      const queue = await getQueueStats();
+      // BullMQ Queue#getWorkers() returns one entry per live Worker process
+      // connected to the queue (across every container/replica). It does NOT
+      // report per-slot concurrency, so "active" here is the number of
+      // worker processes currently leasing a job, derived from queue.active
+      // capped by the worker count. Idle = remaining workers.
+      let totalWorkers = 0;
+      if (typeof runQueue?.getWorkers === "function") {
+        const workers = await runQueue.getWorkers();
+        totalWorkers = Array.isArray(workers) ? workers.length : 0;
+      }
+      const activeWorkers = Math.min(queue.active || 0, totalWorkers);
+      const idleWorkers = Math.max(0, totalWorkers - activeWorkers);
+      workerPool = {
+        mode: "distributed",
+        queue,
+        activeWorkers,
+        idleWorkers,
+        totalWorkers,
+      };
+    } catch {
+      // Best-effort — never let queue introspection fail the dashboard.
+    }
+  }
+
+  // ── AUTO-022: AI eval-harness trend (30-day, per-runId aggregation) ─────
+  // Best-effort — the eval harness writes via `--persist` flag which is
+  // opt-in. When no rows exist, `getEvalTrend()` returns `[]` and we surface
+  // `evalTrend: null` so the frontend renders an empty-state hint.
+  //
+  // EVAL_HARNESS_PROJECT_ID is a sentinel projectId — eval rows are NOT
+  // workspace-scoped because the harness runs against a frozen golden set
+  // shared across all tenants. Every workspace sees the same evalTrend.
+  // This is intentional: AUTO-022 measures the AI pipeline's quality, which
+  // is a deployment-wide concern, not a per-tenant one.
+  const EVAL_TREND_WINDOW_DAYS = 30;
+  let evalTrend = null;
+  try {
+    const runs30d = getEvalTrend({ windowDays: EVAL_TREND_WINDOW_DAYS });
+    if (runs30d.length > 0) {
+      evalTrend = {
+        runs: runs30d,
+        latestRunId: runs30d[runs30d.length - 1].runId,
+        windowDays: EVAL_TREND_WINDOW_DAYS,
+      };
+    }
+  } catch (err) {
+    // Best-effort — never let an eval-query failure dark the whole dashboard.
+    console.error(formatLogLine("warn", null, `[dashboard] evalTrend lookup failed: ${err?.message || err}`));
+  }
+
+  // AUTO-009 — dedicated lean read for coverage trend. `getRunsWithCoverage`
+  // selects only `id, projectId, startedAt, type, coverageSummary` so the
+  // potentially-multi-KB summary blob doesn't bloat `LEAN_COLS` for every
+  // dashboard read. Returns chronological order already (newest last).
+  //
+  // Trend semantics:
+  //   - **Real 30-day date filter** anchored at `now - 30 days`. The
+  //     `windowDays: 30` label on the response is now honest — only points
+  //     within the rolling 30-day window are included. (The previous
+  //     `.slice(-30)` was a count-cap masquerading as a time window: a
+  //     workspace with 100 coverage runs in one day would surface 30 points
+  //     from a single afternoon, mislabelled as "30-day".)
+  //   - **Per-project slice of 30 max points each.** Sparkline is rendered
+  //     per project, so the natural denominator is per project, not global.
+  //     A global `.slice(-30)` evicted quiet projects' history entirely
+  //     when a single busy project produced 30+ coverage runs.
+  //
+  // `COVERAGE_TREND_WINDOW_DAYS` and `COVERAGE_TREND_MAX_PER_PROJECT` match
+  // the dashboard's sparkline density target (one point per coverage-enabled
+  // run, capped so the payload doesn't unbounded on a CI-heavy project).
+  const COVERAGE_TREND_WINDOW_DAYS = 30;
+  const COVERAGE_TREND_MAX_PER_PROJECT = 30;
+  const coverageRuns = runRepo.getRunsWithCoverage(projectIds);
+  const coverageTrend = (() => {
+    const windowCutoff = Date.now() - COVERAGE_TREND_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+    // First pass: filter on data validity + date window, group by projectId.
+    // `coverageRuns` is chronological asc, so each per-project bucket also
+    // ends up chronological asc — needed for the .slice(-30) below to keep
+    // the *most recent* 30 per project.
+    const byProject = new Map();
+    for (const r of coverageRuns) {
+      if (r.coverageSummary?.coveragePct == null) continue;
+      if (!r.startedAt) continue;
+      if (new Date(r.startedAt).getTime() < windowCutoff) continue;
+      if (!byProject.has(r.projectId)) byProject.set(r.projectId, []);
+      byProject.get(r.projectId).push(r);
+    }
+    // Second pass: cap per-project series at the max-per-project ceiling,
+    // then flatten + sort by date asc so the frontend's per-project group-by
+    // still works on the flat array.
+    const series = [];
+    for (const projectRuns of byProject.values()) {
+      const capped = projectRuns.slice(-COVERAGE_TREND_MAX_PER_PROJECT);
+      for (const r of capped) {
+        series.push({
+          date: r.startedAt,
+          projectId: r.projectId,
+          coveragePct: r.coverageSummary.coveragePct,
+          // AUTO-009c — per-metric series so the Dashboard can switch between
+          // line / branch / function sparklines without re-querying. Missing
+          // on pre-AUTO-009c runs; the frontend falls back to coveragePct.
+          statementPct: r.coverageSummary.statementPct ?? null,
+          branchPct:    r.coverageSummary.branchPct    ?? null,
+          functionPct:  r.coverageSummary.functionPct  ?? null,
+        });
+      }
+    }
+    series.sort((a, b) => new Date(a.date) - new Date(b.date));
+    return series.length > 0 ? { windowDays: COVERAGE_TREND_WINDOW_DAYS, series } : null;
+  })();
+
+  // AUTO-009 — latest coverageSummary per project so the Dashboard's
+  // `topUncoveredFiles` block can render without re-querying. Sourced from
+  // the same coverage-only result set; we walk it newest-last and keep
+  // the most recent entry per projectId.
+  //
+  // `projectName` is stamped server-side from the already-loaded
+  // `projectsById` map so the CoveragePanel can always display a human-
+  // readable name. The previous approach (`recentRuns.find(...)?.projectName`)
+  // missed projects whose latest run was older than the 8-run `recentRuns`
+  // cap — those rendered as a truncated UUID.
+  const latestCoverageByProject = {};
+  for (const r of coverageRuns) {
+    if (r?.projectId && r.coverageSummary) {
+      latestCoverageByProject[r.projectId] = {
+        ...r.coverageSummary,
+        projectName: projectsById[r.projectId]?.name || null,
+      };
+    }
+  }
+
+  res.json({
+    totalProjects: projects.length,
+    totalTests: tests.length,
+    totalRuns: runs.length,
+    totalActivities: activityRepo.countFiltered({ workspaceId: req.workspaceId }),
+    passRate,
+    history,
+    recentRuns,
+    runsByStatus,
+    testsByReview,
+    testsCreatedToday,
+    testsCreatedThisWeek,
+    testsGeneratedTotal,
+    testsAutoFixed,
+    healingEntries,
+    healingSuccesses,
+    avgRunDurationMs,
+    defectBreakdown,
+    flakyTestCount,
+    topFlakyTests,
+    workerPool,
+    testGrowth,
+    mttrMs,
+    testsByUrl,
+    topAccessibilityOffenders,
+    environmentPassRates, // DIF-012 — null when no envs configured
+    evalTrend,            // AUTO-022 — null when no eval rows persisted
+    coverageTrend,        // AUTO-009 — null when no coverage-enabled runs persisted
+    latestCoverageByProject, // AUTO-009 — { projectId: coverageSummary } for the Dashboard's `topUncoveredFiles` panel
+  });
+  } catch (err) {
+    console.error(formatLogLine("error", null, `[dashboard] ${err?.stack || err?.message || err}`));
+    return res.status(500).json({ error: "Dashboard data unavailable." });
+  }
+});
+
+/**
+ * AUTO-022 — per-run drill-down for the Dashboard `EvalPanel`.
+ *
+ * Returns the per-case breakdown for one eval run: every case's four
+ * dimension scores, the persisted `actual` Playwright code emitted by the
+ * harness at run time, and the matching `expected` lifted from the on-disk
+ * golden JSON. Cross-tenant by design (eval rows live under the
+ * `__eval_harness__` sentinel, not under any workspace).
+ *
+ * 404 when the runId has no rows in `metric_samples` (or when the harness
+ * ran without `--persist` so no rows were written).
+ */
+router.get("/dashboard/eval/:runId", (req, res) => {
+  try {
+    const detail = getEvalRunCases(req.params.runId);
+    if (!detail) {
+      return res.status(404).json({ error: "Eval run not found." });
+    }
+
+    // Layer `expected` onto each case from the golden JSON on disk. Goldens
+    // are loaded once and indexed so the lookup is O(1) per case.
+    let expectedByCaseId = {};
+    try {
+      const goldens = loadGoldens(EVAL_GOLDEN_DIR);
+      for (const g of goldens) {
+        expectedByCaseId[g.id] = g.expected;
+      }
+    } catch (err) {
+      // Goldens dir missing or unreadable — degrade gracefully. The UI will
+      // show `expected: null` and a hint that the fixtures aren't on this
+      // host (rare; would only happen on a stripped Docker image).
+      console.error(formatLogLine("warn", null, `[dashboard] eval goldens load failed: ${err?.message || err}`));
+    }
+
+    return res.json({
+      runId: detail.runId,
+      createdAt: detail.createdAt,
+      cases: detail.cases.map((c) => ({
+        ...c,
+        expected: expectedByCaseId[c.caseId] ?? null,
+      })),
+    });
+  } catch (err) {
+    console.error(formatLogLine("error", null, `[dashboard] eval/:runId ${err?.stack || err?.message || err}`));
+    return res.status(500).json({ error: "Eval run detail unavailable." });
+  }
+});
+
+export default router;

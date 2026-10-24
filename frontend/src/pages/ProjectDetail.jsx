@@ -1,0 +1,754 @@
+import React, { useEffect, useState, useCallback, useMemo } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import {
+  Search, Trash2, ArrowRight,
+  ThumbsUp, ThumbsDown,
+  RotateCcw, Info,
+} from "lucide-react";
+import { api } from "../api.js";
+import { queryClient, projectDetailQueryKeys } from "../queryClient.js";
+import {
+  useProjectDetailQuery,
+  useTraceabilityQuery,
+} from "../hooks/queries/useProjectDetailQueries.js";
+import { invalidateReviewQueueCache } from "../hooks/queries/useReviewQueueQuery.js";
+import AgentTag from "../components/shared/AgentTag.jsx";
+import ModalShell from "../components/shared/ModalShell.jsx";
+import { cleanTestName } from "../utils/formatTestName.js";
+import { testTypeBadgeClass, testTypeLabel, isBddTest } from "../utils/testTypeLabels.js";
+import { StatusBadge, ReviewBadge, ScenarioBadges } from "../components/shared/TestBadges.jsx";
+import usePageTitle from "../hooks/usePageTitle.js";
+import useProjectRunMonitor from "../hooks/useProjectRunMonitor.js";
+import { useNotifications } from "../context/NotificationContext.jsx";
+import { useAuth } from "../context/AuthContext.jsx";
+import { userHasRole } from "../utils/roles.js";
+import ActiveRunBanner from "../components/project/ActiveRunBanner.jsx";
+import RunToast from "../components/project/RunToast.jsx";
+import RunsTab from "../components/project/RunsTab.jsx";
+import TraceabilityTab from "../components/project/TraceabilityTab.jsx";
+import EnvironmentsTab from "../components/project/EnvironmentsTab.jsx";
+
+import ProjectHeader from "../components/project/ProjectHeader.jsx";
+import TablePagination from "../components/shared/TablePagination.jsx";
+
+function ConfBar({ score }) {
+  if (score == null) return <span style={{ color: "var(--text3)", fontSize: "0.73rem" }}>—</span>;
+  const color = score >= 80 ? "var(--green)" : score >= 60 ? "var(--amber)" : "var(--red)";
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+      <div style={{ width: 52, height: 4, borderRadius: 2, background: "var(--bg3)", overflow: "hidden" }}>
+        <div style={{ width: `${score}%`, height: "100%", background: color, borderRadius: 2 }} />
+      </div>
+      <span style={{ fontSize: "0.73rem", color: "var(--text2)", fontWeight: 500 }}>{score}%</span>
+    </div>
+  );
+}
+
+// Tests created within this window are considered "new" and highlighted.
+const NEW_TEST_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+
+export default function ProjectDetail() {
+  const { id } = useParams();
+  const navigate = useNavigate();
+
+  const [activeRun, setActiveRun]         = useState(null);
+  const [activeRunId, setActiveRunId]     = useState(null); // for toast link
+  const [actionLoading, setActionLoading] = useState(null);
+  const [parallelWorkers, setParallelWorkers] = useState(1);
+  const [tab, setTab]                     = useState("review");
+  const [reviewFilter, setReviewFilter]   = useState("draft");
+  const [categoryFilter, setCategoryFilter] = useState("all"); // "all" | "ui" | "api"
+  const [searchInput, setSearchInput]     = useState("");
+  const [search, setSearch]               = useState("");
+  const [selected, setSelected]           = useState(new Set());
+  const [reviewPage, setReviewPage]         = useState(1);
+  const PAGE_SIZE = 10;
+  const [runsPage, setRunsPage]           = useState(1);
+  const [toast, setToast]                 = useState({ msg: "", type: "info", visible: false, showLink: false, runId: null });
+  const [showNewBadges, setShowNewBadges] = useState(true);
+  const [now, setNow] = useState(Date.now);
+
+  // ── TanStack Query: composite project detail + traceability ─────────────
+  const detailQuery = useProjectDetailQuery({
+    projectId: id,
+    reviewPage,
+    runsPage,
+    reviewFilter,
+    categoryFilter,
+    search,
+  });
+  const data = detailQuery.data;
+  const project = data?.project ?? null;
+  const tests = data?.tests ?? [];
+  const testsMeta = data?.testsMeta ?? { total: 0, page: 1, pageSize: PAGE_SIZE, hasMore: false };
+  const runs = data?.runs ?? [];
+  const runsMeta = data?.runsMeta ?? { total: 0, page: 1, pageSize: PAGE_SIZE, hasMore: false };
+  const testCounts = data?.testCounts ?? { draft: 0, approved: 0, rejected: 0, total: 0, passed: 0, failed: 0, api: 0, ui: 0 };
+  const loading = detailQuery.isLoading;
+
+  const traceabilityQuery = useTraceabilityQuery(id, tab === "traceability");
+  const traceability = traceabilityQuery.data ?? null;
+  const traceLoading = traceabilityQuery.isLoading && tab === "traceability";
+
+  usePageTitle(project?.name ? `${project.name} — Project` : "Project");
+  const { addNotification } = useNotifications();
+  const { user: authUser } = useAuth();
+  const canEdit = userHasRole(authUser, "qa_lead");
+
+  // ── Debounce search input → search state (300ms) ───────────────────────────
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setSearch(searchInput);
+      setReviewPage(1);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchInput]);
+
+  // ── Highlight recently created tests ──────────────────────────────────────
+  // Any test created within the last 5 minutes is "new" — works regardless of
+  // how the user navigated here (breadcrumbs, back button, direct link, etc.)
+  const newTestIds = useMemo(() => {
+    if (!showNewBadges) return new Set();
+    const cutoff = now - NEW_TEST_THRESHOLD_MS;
+    const ids = new Set();
+    for (const t of tests) {
+      if (t.createdAt && new Date(t.createdAt).getTime() > cutoff) {
+        ids.add(t.id);
+      }
+    }
+    return ids;
+  }, [tests, showNewBadges, now]);
+
+  // Auto-expire "NEW" badges: tick `now` every 60s so the useMemo re-evaluates
+  // and drops tests that have aged past the 5-minute threshold.
+  useEffect(() => {
+    if (!showNewBadges) return;
+    const timer = setInterval(() => setNow(Date.now()), 60_000);
+    return () => clearInterval(timer);
+  }, [showNewBadges]);
+
+  const showToast = (msg, type = "info", runId = null) => {
+    setToast({ msg, type, visible: true, showLink: !!runId, runId });
+    setTimeout(() => setToast(t => ({ ...t, visible: false })), type === "error" ? 5000 : 3500);
+  };
+
+  // Cache invalidation: bust every cached projectDetail query for this project
+  // (across any combination of paging/filter inputs). The composite useQuery
+  // re-runs automatically because its key includes the same project id.
+  const refresh = useCallback(
+    () => queryClient.invalidateQueries({ queryKey: projectDetailQueryKeys.root }),
+    [],
+  );
+
+  // Clamp pages when totals shrink below the current page (e.g. after a bulk
+  // delete leaves fewer pages than the cursor). Done as an effect on totals
+  // change rather than inside the fetch — the previous implementation read
+  // refs to avoid an infinite loop, but query-key-driven refetch makes that
+  // dance unnecessary.
+  useEffect(() => {
+    const total = Math.max(1, Math.ceil(testsMeta.total / PAGE_SIZE));
+    if (reviewPage > total) setReviewPage(total);
+  }, [testsMeta.total, reviewPage]);
+  useEffect(() => {
+    const total = Math.max(1, Math.ceil(runsMeta.total / PAGE_SIZE));
+    if (runsPage > total) setRunsPage(total);
+  }, [runsMeta.total, runsPage]);
+
+  const handleRunSettled = useCallback((evt) => {
+    setActiveRun(null);
+    refresh();
+
+    // Push in-app notification when a run finishes on the project page.
+    // evt may be a "done" SSE payload ({ status, passed, failed, ... }) or
+    // a full run object from a snapshot ({ status, passed, failed, tests, ... }).
+    if (evt) {
+      const status = evt.status ?? "completed";
+      const passed = evt.passed;
+      const failed = evt.failed;
+      const testsGenerated = evt.testsGenerated ?? (Array.isArray(evt.tests) ? evt.tests.length : undefined);
+      const isTestRun = passed != null || failed != null;
+      const notifType = status === "completed"       ? "success"
+                      : status === "completed_empty" ? "warning"
+                      : status === "aborted"         ? "warning"
+                      : "error";
+      addNotification({
+        type: notifType,
+        title: status === "completed_empty" ? "No tests generated"
+             : status === "aborted" ? "Run aborted"
+             : status === "failed"  ? "Run failed"
+             : "Run complete",
+        body: isTestRun
+          ? `${passed ?? 0} passed · ${failed ?? 0} failed`
+          : status === "completed_empty"
+            ? "Crawl completed but generated 0 tests — check project settings"
+            : `${testsGenerated ?? 0} test(s) generated`,
+        link: activeRunId ? `/runs/${activeRunId}` : null,
+      });
+    }
+  }, [refresh, addNotification, activeRunId]);
+  const { sseDown, retryIn, pagesChanged } = useProjectRunMonitor(activeRun, handleRunSettled);
+
+  async function doRun() {
+    setActionLoading("run");
+    try {
+      const body = parallelWorkers > 1 ? { dialsConfig: { parallelWorkers } } : undefined;
+      const { runId } = await api.runTests(id, body);
+      setActiveRun(runId);
+      setActiveRunId(runId);
+      const modeHint = parallelWorkers > 1 ? ` (${parallelWorkers}x parallel)` : "";
+      showToast(`Regression run started${modeHint}`, "info", runId);
+    } catch (err) {
+      showToast(err.message, "error");
+    } finally {
+      setActionLoading(null);
+    }
+  }
+
+  async function reviewOne(testId, action) {
+    try {
+      if (action === "approve") await api.approveTest(id, testId);
+      else if (action === "reject") await api.rejectTest(id, testId);
+      else if (action === "restore") await api.restoreTest(id, testId);
+      await refresh();
+      // Bust the Review Queue cache too — the cross-project list, tab-count
+      // badges, and the sidebar draft-count badge all live under the
+      // `reviewQueueQueryKeys.root` namespace and would otherwise display
+      // stale counts after a per-project mutation.
+      invalidateReviewQueueCache();
+      setSelected(s => { const n = new Set(s); n.delete(testId); return n; });
+      const msgs = { approve: "Test approved → Regression suite", reject: "Test rejected", restore: "Test restored to Draft" };
+      showToast(msgs[action], action === "approve" ? "success" : action === "reject" ? "error" : "info");
+    } catch (err) { showToast(err.message, "error"); }
+  }
+
+  const [bulkConfirm, setBulkConfirm] = React.useState(null); // {action, ids}
+
+  function requestBulkAction(action) {
+    const ids = selected.size > 0
+      ? Array.from(selected)
+      : filteredByReview.map(t => t.id);
+    if (!ids.length) return;
+    // Require confirmation when operating on all visible tests
+    if (selected.size === 0 && ids.length > 1) {
+      setBulkConfirm({ action, ids });
+      return;
+    }
+    executeBulkAction(action, ids);
+  }
+
+  async function executeBulkAction(action, ids) {
+    setBulkConfirm(null);
+    if (!ids?.length) return;
+    try {
+      const res = await api.bulkUpdateTests(id, ids, action);
+      await refresh();
+      invalidateReviewQueueCache();
+      setSelected(new Set());
+      const label = action === "approve" ? "approved → Regression" : action === "reject" ? "rejected" : "restored to Draft";
+      showToast(`${res.updated} tests ${label}`, action === "approve" ? "success" : "info");
+    } catch (err) { showToast(err.message, "error"); }
+  }
+
+  async function executeBulkDelete(ids) {
+    setBulkConfirm(null);
+    if (!ids?.length) return;
+    try {
+      const res = await api.bulkDeleteTests(id, ids);
+      await refresh();
+      invalidateReviewQueueCache();
+      setSelected(new Set());
+      showToast(`${res.deleted} test${res.deleted !== 1 ? "s" : ""} deleted`, "info");
+    } catch (err) { showToast(err.message, "error"); }
+  }
+
+  function requestBulkDelete() {
+    const ids = selected.size > 0
+      ? Array.from(selected)
+      : filteredByReview.map(t => t.id);
+    if (!ids.length) return;
+    setBulkConfirm({ action: "delete", ids });
+  }
+
+  // Keep old name as alias so existing call sites work unchanged
+  function bulkAction(action) { requestBulkAction(action); }
+
+  function toggleSelect(testId) {
+    setSelected(s => { const n = new Set(s); n.has(testId) ? n.delete(testId) : n.add(testId); return n; });
+  }
+
+  function toggleAll(checked, ids) {
+    setSelected(checked ? new Set(ids) : new Set());
+  }
+
+  // Server-side pagination and filtering — tests are already filtered and paged
+  // by the API. The `testsMeta.total` reflects the filtered count.
+  const filteredByReview = tests;
+  const reviewTotalPages = Math.max(1, Math.ceil(testsMeta.total / PAGE_SIZE));
+  const pagedReview = tests;
+
+  if (loading) return (
+    <div style={{ maxWidth: 980, margin: "0 auto" }}>
+      {[80, 400].map((h, i) => <div key={i} className="skeleton" style={{ height: h, borderRadius: 12, marginBottom: 16 }} />)}
+    </div>
+  );
+  if (!project) return (
+    <div style={{ padding: "80px 0", textAlign: "center", color: "var(--text2)", maxWidth: 480, margin: "0 auto" }}>
+      <div style={{ fontSize: "2.5rem", marginBottom: 12 }}>🔍</div>
+      <div style={{ fontWeight: 700, fontSize: "1.1rem", color: "var(--text)", marginBottom: 8 }}>Project not found</div>
+      <div style={{ fontSize: "0.875rem", marginBottom: 24 }}>This project may have been deleted or the link is invalid.</div>
+      <button className="btn btn-primary" onClick={() => navigate("/projects")}>Back to Projects</button>
+    </div>
+  );
+
+  // Build dynamic bulk button labels based on selection scope.
+  // With server-side pagination, filteredByReview is only the current page —
+  // say "N visible" (not "all N") to avoid implying cross-page scope.
+  const bulkScope = selected.size > 0
+    ? `${selected.size} selected`
+    : `${filteredByReview.length} visible`;
+
+  return (
+    <div className="fade-in" style={{ maxWidth: 980, margin: "0 auto" }}>
+
+      {/* Project header */}
+      <ProjectHeader
+        project={project}
+        projectId={id}
+        tests={tests}
+        totalTests={testCounts.total}
+        parallelWorkers={parallelWorkers}
+        onWorkersChange={setParallelWorkers}
+        actionLoading={actionLoading}
+        onRun={doRun}
+        stats={{
+          draftTests: { length: testCounts.draft },
+          approvedTests: { length: testCounts.approved },
+          rejectedTests: { length: testCounts.rejected },
+          apiTests: { length: testCounts.api ?? 0 },
+          uiTests: { length: testCounts.ui ?? 0 },
+          passed: testCounts.passed ?? 0,
+          failed: testCounts.failed ?? 0,
+        }}
+      />
+
+      {/* Active run banner — now the primary CTA to view run, tab stays put */}
+      <ActiveRunBanner
+        activeRun={activeRun}
+        sseDown={sseDown}
+        retryIn={retryIn}
+        pagesChanged={pagesChanged}
+        onAbort={async () => {
+          try {
+            await api.abortRun(activeRun);
+            setActiveRun(null);
+            showToast("Run aborted", "info");
+            refresh();
+          } catch (err) { showToast(err.message, "error"); }
+        }}
+        onViewLive={() => navigate(`/runs/${activeRun}`)}
+      />
+
+      {/* Draft-pending reminder — only show on Runs tab or when viewing non-draft filter */}
+      {testCounts.draft > 0 && (tab === "runs" || (tab === "review" && reviewFilter !== "draft")) && (
+        <div className="pd-banner pd-banner--amber">
+          <Info size={14} color="var(--amber)" className="shrink-0" />
+          <span className="pd-banner-text-amber">
+            <strong>{testCounts.draft} test{testCounts.draft !== 1 ? "s" : ""}</strong> pending review — approve to add to regression.
+          </span>
+          <button className="btn btn-ghost btn-xs" style={{ marginLeft: "auto" }} onClick={() => { setTab("review"); setReviewFilter("draft"); }}>
+            Review drafts <ArrowRight size={11} />
+          </button>
+        </div>
+      )}
+
+      {/* Tabs */}
+      <div className="pd-tab-bar">
+        {[
+          ["review", `Tests (${testCounts.total})`],
+          ["runs",   `Runs (${runsMeta.total})`],
+          ["environments", "Environments"],
+          ["traceability", "Traceability"],
+        ].map(([key, label]) => (
+          <button key={key} onClick={() => setTab(key)} className={`pd-tab${tab === key ? " pd-tab--active" : ""}`}>
+            {key === "review" && testCounts.draft > 0 && (
+              <span className="pd-tab-badge">{testCounts.draft}</span>
+            )}
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* ── GENERATED TESTS / REVIEW TAB ── */}
+      {tab === "review" && (
+        <div>
+          {/* New tests banner — only show on draft or all filter (new tests are always drafts) */}
+          {newTestIds.size > 0 && (reviewFilter === "draft" || reviewFilter === "all") && (
+            <div className="pd-banner pd-banner--green">
+              <span style={{ fontSize: "1rem" }}>✨</span>
+              <span className="pd-banner-text-green">
+                <strong>{newTestIds.size} new test{newTestIds.size !== 1 ? "s" : ""}</strong> generated — review and approve to add to regression.
+              </span>
+              <button
+                className="btn btn-ghost btn-xs"
+                style={{ marginLeft: "auto", flexShrink: 0 }}
+                onClick={() => setShowNewBadges(false)}
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+
+          {testCounts.total === 0 ? (
+            <div className="card pd-empty">
+              <Search size={32} style={{ opacity: 0.25, marginBottom: 12 }} />
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>No tests yet</div>
+              <div style={{ fontSize: "0.875rem", marginBottom: 14 }}>Go to the Tests page to crawl this project or generate tests from a requirement.</div>
+              <button className="btn btn-primary btn-sm" onClick={() => navigate("/tests")}>
+                Go to Tests
+              </button>
+            </div>
+          ) : (
+            <>
+              {/* Filter + search row */}
+              <div className="pd-filter-row">
+                {[
+                  ["draft",    `Draft (${testCounts.draft})`,       "var(--amber)"],
+                  ["approved", `Approved (${testCounts.approved})`, "var(--green)"],
+                  ["rejected", `Rejected (${testCounts.rejected})`, "var(--red)"  ],
+                  ["all",      `All (${testCounts.total})`,         "var(--text2)"],
+                ].map(([key, label, color]) => (
+                  <button key={key} onClick={() => { setReviewFilter(key); setSelected(new Set()); setReviewPage(1); }}
+                    className="pd-filter-pill"
+                    style={{
+                      borderColor: reviewFilter === key ? color : undefined,
+                      color: reviewFilter === key ? color : undefined,
+                    }}>{label}</button>
+                ))}
+
+                {(testCounts.api ?? 0) > 0 && (
+                  <>
+                    <div className="pd-filter-divider" />
+                    {[
+                      ["ui",  `UI (${testCounts.ui ?? 0})`,   "#7c3aed"],
+                      ["api", `🌐 API (${testCounts.api ?? 0})`, "#2563eb"],
+                    ].map(([key, label, color]) => (
+                      <button key={key} onClick={() => { setCategoryFilter(categoryFilter === key ? "all" : key); setSelected(new Set()); setReviewPage(1); }}
+                        className="pd-filter-pill"
+                        style={{
+                          borderColor: categoryFilter === key ? color : undefined,
+                          background: categoryFilter === key ? `${color}14` : undefined,
+                          color: categoryFilter === key ? color : undefined,
+                        }}>{label}</button>
+                    ))}
+                  </>
+                )}
+                <div className="flex-1" />
+                <div className="pd-search-wrap">
+                  <Search size={12} color="var(--text3)" className="pd-search-icon" />
+                  <input className="input pd-search-input" value={searchInput} onChange={e => setSearchInput(e.target.value)}
+                    placeholder="Search tests..." />
+                </div>
+              </div>
+
+              {/* Bulk action bar — dynamic labels show exact scope */}
+              {(reviewFilter === "draft" || selected.size > 0) && filteredByReview.length > 0 && (
+                <div className="pd-bulk-bar">
+                  <span className="pd-bulk-label">
+                    {selected.size > 0 ? `${selected.size} selected` : `${filteredByReview.length} draft tests visible`}
+                  </span>
+                  <button className="btn btn-sm" style={{ background: "var(--green-bg)", color: "var(--green)", border: "1px solid #86efac" }}
+                    onClick={() => bulkAction("approve")}>
+                    <ThumbsUp size={12} /> Approve {bulkScope}
+                  </button>
+                  <button className="btn btn-sm" style={{ background: "var(--red-bg)", color: "var(--red)", border: "1px solid #fca5a5" }}
+                    onClick={() => bulkAction("reject")}>
+                    <ThumbsDown size={12} /> Reject {bulkScope}
+                  </button>
+                  {canEdit && (
+                  <button className="btn btn-sm" style={{ background: "var(--red-bg)", color: "var(--red)", border: "1px solid #fca5a5" }}
+                    onClick={requestBulkDelete}>
+                    <Trash2 size={12} /> Delete {bulkScope}
+                  </button>
+                  )}
+                  {selected.size > 0 && (
+                    <button className="btn btn-ghost btn-sm" onClick={() => setSelected(new Set())}>Clear selection</button>
+                  )}
+                </div>
+              )}
+
+              <div className="card pd-review-table">
+                {filteredByReview.length === 0 ? (
+                  // ONB-002 (audit §6.4): the bare "No drafts" text used to
+                  // sit here with no recovery path. Per-filter coaching:
+                  // - draft empty → reviewer cleared the inbox (Inbox-zero
+                  //   moment). Suggest generating more tests OR auditing
+                  //   recent approvals, matching ReviewQueue's branch at
+                  //   `frontend/src/pages/ReviewQueue.jsx:973-1007`.
+                  // - approved/rejected empty → just an empty filter; offer
+                  //   to switch back to Draft or All.
+                  // - search/category active and empty → coach to clear.
+                  <div className="pd-empty-sm pd-empty-sm--coached">
+                    {reviewFilter === "draft" ? (
+                      <>
+                        <div className="pd-empty-sm__title">Inbox zero — all drafts reviewed</div>
+                        <div className="pd-empty-sm__desc">
+                          Nice work. Generate more tests or audit recent approvals to keep coverage growing.
+                        </div>
+                        <div className="pd-empty-sm__actions">
+                          <button
+                            className="btn btn-primary btn-sm"
+                            onClick={() => navigate(`/projects/${id}/test-lab`)}
+                          >
+                            Generate more tests →
+                          </button>
+                          {testCounts.approved > 0 && (
+                            <button
+                              className="btn btn-ghost btn-sm"
+                              onClick={() => { setReviewFilter("approved"); setReviewPage(1); }}
+                            >
+                              Audit approvals
+                            </button>
+                          )}
+                        </div>
+                      </>
+                    ) : reviewFilter === "approved" ? (
+                      <>
+                        <div className="pd-empty-sm__title">No approved tests yet</div>
+                        <div className="pd-empty-sm__desc">
+                          Tests move here once a reviewer approves them. Start with the Draft queue.
+                        </div>
+                        <button
+                          className="btn btn-primary btn-sm pd-empty-sm__cta"
+                          onClick={() => { setReviewFilter("draft"); setReviewPage(1); }}
+                          disabled={testCounts.draft === 0}
+                        >
+                          Review {testCounts.draft} draft{testCounts.draft !== 1 ? "s" : ""}
+                        </button>
+                      </>
+                    ) : reviewFilter === "rejected" ? (
+                      <>
+                        <div className="pd-empty-sm__title">No rejected tests</div>
+                        <div className="pd-empty-sm__desc">
+                          Tests a reviewer rejects show up here. The queue is currently clean.
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="pd-empty-sm__title">No tests match this filter</div>
+                        <div className="pd-empty-sm__desc">
+                          Try clearing the category filter or search box.
+                        </div>
+                        <button
+                          className="btn btn-ghost btn-sm pd-empty-sm__cta"
+                          onClick={() => {
+                            setReviewFilter("draft");
+                            setCategoryFilter("all");
+                            setSearchInput("");
+                            setReviewPage(1);
+                          }}
+                        >
+                          Clear filters
+                        </button>
+                      </>
+                    )}
+                  </div>
+                ) : (
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th style={{ width: 36, paddingRight: 0 }}>
+                          <input type="checkbox"
+                            checked={pagedReview.length > 0 && pagedReview.every(t => selected.has(t.id))}
+                            onChange={e => toggleAll(e.target.checked, pagedReview.map(t => t.id))}
+                            className="pd-checkbox" />
+                        </th>
+                        <th>Test ID</th>
+                        <th>Test Name</th>
+                        <th>Status</th>
+                        <th>Review</th>
+                        <th>Type</th>
+                        <th>Confidence</th>
+                        <th>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pagedReview.map(t => {
+                        const rs = t.reviewStatus || "draft";
+                        const isSelected = selected.has(t.id);
+                        const isNew = newTestIds.has(t.id);
+                        return (
+                          <tr key={t.id} style={{
+                            background: isSelected ? "var(--accent-bg)" : isNew ? "rgba(34,197,94,0.06)" : undefined,
+                            transition: "background 0.3s",
+                          }}>
+                            <td style={{ paddingRight: 0 }}>
+                              <input type="checkbox" checked={isSelected} onChange={() => toggleSelect(t.id)}
+                                className="pd-checkbox" />
+                            </td>
+                            <td>
+                              <span className="mono-id">
+                                {t.id.length > 8 ? t.id.slice(0, 8) + "…" : t.id}
+                              </span>
+                            </td>
+                            <td style={{ cursor: "pointer" }} onClick={() => navigate(`/tests/${t.id}`)}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                                <AgentTag type="TA" />
+                                <div>
+                                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                                    <span style={{ fontWeight: 500, fontSize: "0.875rem" }}>{cleanTestName(t.name)}</span>
+                                    {isNew && (
+                                      <span className="pd-new-badge">NEW</span>
+                                    )}
+                                  </div>
+                                  {t.description && <div style={{ fontSize: "0.73rem", color: "var(--text3)", marginTop: 1 }}>{t.description?.slice(0, 64)}</div>}
+                                  <div style={{ display: "flex", gap: 4, marginTop: 4, flexWrap: "wrap" }}>
+                                    <ScenarioBadges test={t} isBddTest={isBddTest} />
+                                  </div>
+                                </div>
+                              </div>
+                            </td>
+                            <td><StatusBadge s={t.lastResult} /></td>
+                            <td><ReviewBadge status={rs} /></td>
+                            <td>
+                              {t.type && (
+                                <span className={`badge ${testTypeBadgeClass(t.type)}`}>
+                                  {testTypeLabel(t.type, true)}
+                                </span>
+                              )}
+                            </td>
+                            <td><ConfBar score={t.qualityScore != null ? Math.min(100, Math.round(t.qualityScore)) : null} /></td>
+                            <td>
+                              <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                                {rs === "draft" && (
+                                  <>
+                                    <button className="btn btn-xs" style={{ background: "var(--green-bg)", color: "var(--green)", border: "1px solid #86efac" }}
+                                      onClick={() => reviewOne(t.id, "approve")}>
+                                      <ThumbsUp size={11} /> Approve
+                                    </button>
+                                    <button className="btn btn-xs" style={{ background: "var(--red-bg)", color: "var(--red)", border: "1px solid #fca5a5" }}
+                                      onClick={() => reviewOne(t.id, "reject")}>
+                                      <ThumbsDown size={11} /> Reject
+                                    </button>
+                                  </>
+                                )}
+                                {(rs === "approved" || rs === "rejected") && (
+                                  <button className="btn btn-ghost btn-xs" onClick={() => reviewOne(t.id, "restore")} title="Move back to Draft">
+                                    <RotateCcw size={11} /> Restore
+                                  </button>
+                                )}
+                                {canEdit && (
+                                <button className="btn btn-ghost btn-xs" onClick={() => {
+                                  if (!window.confirm(`Delete test "${t.name}"? This cannot be undone.`)) return;
+                                  api.deleteTest(id, t.id).then(refresh).catch(err => showToast(err.message, "error"));
+                                }}>
+                                  <Trash2 size={11} />
+                                </button>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+
+              {/* Pagination — server-side, changing page triggers refresh */}
+              <TablePagination
+                total={testsMeta.total}
+                page={reviewPage}
+                totalPages={reviewTotalPages}
+                onPageChange={setReviewPage}
+                label="tests"
+              />
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ── RUNS TAB ── */}
+      {tab === "runs" && (
+        <RunsTab
+          runs={runs}
+          meta={runsMeta}
+          page={runsPage}
+          onPageChange={setRunsPage}
+        />
+      )}
+
+      {/* ── ENVIRONMENTS TAB (DIF-012) ── */}
+      {/* Backend gates POST/PATCH/DELETE on `requireRole("admin")`
+          (backend/src/routes/projects.js:102,114,128), so the page-level
+          `canEdit` (qa_lead+) is too permissive here — passing it would let
+          qa_lead users open the form only to hit a 403 toast on submit.
+          Compute an admin-only flag locally so the add/edit form and
+          per-row Edit/Delete buttons are hidden/disabled for qa_lead.
+          QA.md § Environments step 7 documents this exact expectation. */}
+      {tab === "environments" && (
+        <EnvironmentsTab projectId={id} canEdit={userHasRole(authUser, "admin")} onToast={showToast} />
+      )}
+
+      {/* ── TRACEABILITY TAB ── */}
+      {tab === "traceability" && (
+        <TraceabilityTab traceability={traceability} traceLoading={traceLoading} />
+      )}
+
+      {/* Settings tab removed — Quality Gates (AUTO-012) and Web Vitals Budgets
+          (AUTO-017) moved to /automation → per-project card, colocated with
+          tokens + schedules since all four are "how CI runs behave" config. */}
+
+      <RunToast msg={toast.msg} type={toast.type} visible={toast.visible} onViewRun={toast.showLink} runId={toast.runId} />
+
+      {/* Bulk action confirmation modal */}
+      {bulkConfirm && (
+        <ModalShell onClose={() => setBulkConfirm(null)} width="min(420px, 95vw)" ariaLabelledBy="pd-bulk-confirm-title" style={{ padding: "28px 32px" }}>
+          <div id="pd-bulk-confirm-title" className="pd-confirm-title">Confirm bulk action</div>
+          <div className="pd-confirm-body">
+            You are about to <strong>{bulkConfirm.action}</strong> <strong>{bulkConfirm.ids.length} tests</strong> on this page{bulkConfirm.action === "delete" ? ". They will be moved to the recycle bin." : ". This cannot be undone easily."}
+          </div>
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            <button className="btn btn-ghost btn-sm" onClick={() => setBulkConfirm(null)}>Cancel</button>
+            <button
+              className={`btn btn-sm ${bulkConfirm.action === "approve" ? "btn-primary" : "btn-danger"}`}
+              onClick={() => bulkConfirm.action === "delete"
+                ? executeBulkDelete(bulkConfirm.ids)
+                : executeBulkAction(bulkConfirm.action, bulkConfirm.ids)}
+            >
+              {bulkConfirm.action === "approve" ? "Approve all" : bulkConfirm.action === "delete" ? "Delete all" : "Reject all"}
+            </button>
+          </div>
+        </ModalShell>
+      )}
+
+      {/* Fix #20: Keyboard shortcut hint */}
+      <KeyboardShortcuts
+        tab={tab}
+        selected={selected}
+        filteredByReview={filteredByReview}
+        onApprove={() => bulkAction("approve")}
+        onReject={() => bulkAction("reject")}
+        onClearSelection={() => setSelected(new Set())}
+      />
+    </div>
+  );
+}
+
+// Keyboard shortcuts for review actions — only active on the review tab
+function KeyboardShortcuts({ tab, selected, filteredByReview, onApprove, onReject, onClearSelection }) {
+  React.useEffect(() => {
+    function handler(e) {
+      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.isContentEditable) return;
+      // Only fire approve/reject when on the review tab AND something is selected
+      // to prevent accidental bulk actions — matches Tests.jsx behavior
+      if (tab === "review" && selected.size > 0) {
+        if (e.key === "a" && !e.metaKey && !e.ctrlKey) onApprove();
+        if (e.key === "r" && !e.metaKey && !e.ctrlKey) onReject();
+      }
+      if (e.key === "Escape") onClearSelection();
+    }
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [tab, selected, onApprove, onReject, onClearSelection]);
+  return null;
+}

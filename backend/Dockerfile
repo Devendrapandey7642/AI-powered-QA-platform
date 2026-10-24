@@ -1,0 +1,63 @@
+FROM node:20-slim
+
+# §10.2 — `apt-get upgrade` after `apt-get update` pulls Debian security-pool
+# fixes for the base layer's `libcap2` / `libgnutls30` CVEs (and any future
+# layer-level findings) that Trivy gates HIGH/CRITICAL on. Combined with the
+# install step in one RUN so the apt cache is dropped in the same layer.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
+  chromium \
+  ffmpeg \
+  libnss3 \
+  libatk1.0-0 \
+  libatk-bridge2.0-0 \
+  libcups2 \
+  libdrm2 \
+  libxkbcommon0 \
+  libxcomposite1 \
+  libxdamage1 \
+  libxfixes3 \
+  libxrandr2 \
+  libgbm1 \
+  libasound2 \
+  libpango-1.0-0 \
+  libcairo2 \
+  && rm -rf /var/lib/apt/lists/*
+
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+
+WORKDIR /app
+
+COPY backend/package.json backend/package-lock.json* ./
+# DIF-005: the `postinstall` hook in package.json invokes
+# `node scripts/copy-trace-viewer.js`, so the script has to be present in the
+# image before `npm install` runs. Copy the whole `scripts/` directory (small,
+# stable) here rather than after the install step.
+COPY backend/scripts/ ./scripts/
+RUN npm install --omit=dev
+
+# DIF-002: Cross-browser support. Chromium uses the apt-installed system
+# binary (via PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH above). Firefox and WebKit
+# are downloaded from Playwright's CDN with their bundled binaries. The explicit
+# `playwright install` runs after npm install because PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+# skipped the postinstall hook. Adds ~400MB to the image; skip both engines
+# with BUILD_SKIP_FIREFOX_WEBKIT=1 for slimmer chromium-only builds.
+#
+# Use the `playwright` runtime package's bundled CLI directly rather than
+# `npx playwright`. The `@playwright/test` package (which ships the `playwright`
+# bin on $PATH) is a devDependency and was omitted by `npm install --omit=dev`
+# above — so `npx playwright` fails with "playwright: not found" in the image.
+# The runtime `playwright` package does ship `node_modules/playwright/cli.js`
+# which exposes the same `install` subcommand.
+ARG BUILD_SKIP_FIREFOX_WEBKIT=0
+RUN if [ "$BUILD_SKIP_FIREFOX_WEBKIT" != "1" ]; then \
+      node node_modules/playwright/cli.js install firefox webkit; \
+    fi
+
+COPY backend/src/ ./src/
+RUN mkdir -p /app/data
+VOLUME ["/app/data"]
+EXPOSE 3001
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
+  CMD node -e "fetch('http://localhost:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+CMD ["node", "--import", "./src/otel-preload.mjs", "src/index.js"]

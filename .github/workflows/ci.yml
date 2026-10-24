@@ -1,0 +1,441 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main, develop]
+
+# Cancel outdated runs for the same PR when new commits are pushed.
+# Direct pushes to main use the SHA as the group key so they don't collide.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Secrets scanning ──────────────────────────────────────────────────────
+  secrets:
+    name: Secrets — Gitleaks scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # full history so gitleaks can scan all commits in the PR
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gitleaks-action v2 does not accept a `config-path` input; it
+          # honours the GITLEAKS_CONFIG env var instead (passed through to
+          # the underlying gitleaks CLI).
+          GITLEAKS_CONFIG: .github/.gitleaks.toml
+          # GITLEAKS_LICENSE is only required for organisations on the paid plan.
+          # For public repos and personal accounts this can be omitted.
+
+  # ── Backend ───────────────────────────────────────────────────────────────
+  backend:
+    name: Backend — Install, Test & Syntax Check
+    runs-on: ubuntu-latest
+    needs: [secrets]
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        # Use npm install (not npm ci) because there is no package-lock.json yet
+        run: npm install
+
+      - name: Syntax check all source files
+        run: find src -name '*.js' -exec node --check {} +
+
+      - name: Lint migrations (CR-004 — no duplicate numeric prefixes)
+        run: npm run lint:migrations
+
+      - name: Run unit & integration tests
+        run: npm test
+
+      - name: Generate JSDoc (validates all doc comments)
+        run: npm run docs
+
+      - name: Smoke test — server starts and responds
+        run: |
+          node src/index.js &
+          SERVER_PID=$!
+          echo "Server PID: $SERVER_PID"
+
+          # Wait up to 20s for server (use /health which is public)
+          for i in $(seq 1 10); do
+            if curl -sf http://localhost:3001/health > /dev/null 2>&1; then
+              echo "✅ Server is up"
+              break
+            fi
+            echo "Waiting ($i/10)..."
+            sleep 2
+          done
+
+          # Register a test user and login (cookie-based auth)
+          # INF-005: All API routes are now under /api/v1/
+          COOKIE_JAR=$(mktemp)
+          curl -sf -X POST http://localhost:3001/api/v1/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"name":"CI Bot","email":"ci@test.local","password":"CiTestPass123!"}' \
+            | grep -q "Account created" && echo "✅ POST /api/v1/auth/register OK"
+
+          # Login — JWT is set as HttpOnly cookie, not in response body.
+          # Use -c to save cookies (access_token, _csrf) to a jar file.
+          curl -sf -c "$COOKIE_JAR" -X POST http://localhost:3001/api/v1/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"email":"ci@test.local","password":"CiTestPass123!"}' \
+            | grep -q '"user"' && echo "✅ POST /api/v1/auth/login OK"
+
+          # Extract CSRF token from cookie jar for mutating requests
+          CSRF=$(grep '_csrf' "$COOKIE_JAR" | awk '{print $NF}')
+
+          # Verify authenticated endpoints (use -b to send cookies)
+          curl -sf -b "$COOKIE_JAR" http://localhost:3001/api/v1/dashboard | grep -q "totalProjects" && echo "✅ /api/v1/dashboard OK"
+          curl -sf -b "$COOKIE_JAR" http://localhost:3001/api/v1/projects | grep -q "\[\]" && echo "✅ /api/v1/projects OK"
+
+          PROJ=$(curl -sf -b "$COOKIE_JAR" -X POST http://localhost:3001/api/v1/projects \
+            -H "Content-Type: application/json" \
+            -H "X-CSRF-Token: $CSRF" \
+            -d '{"name":"CI Test","url":"https://example.com"}')
+          echo "$PROJ" | grep -q '"name":"CI Test"' && echo "✅ POST /api/v1/projects OK"
+
+          # Verify unauthenticated access is blocked
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/api/v1/dashboard)
+          [ "$HTTP_CODE" = "401" ] && echo "✅ Unauthenticated /api/v1/dashboard returns 401" || echo "❌ Expected 401, got $HTTP_CODE"
+
+          kill $SERVER_PID
+        env:
+          ANTHROPIC_API_KEY: sk-ant-placeholder-for-ci
+          PORT: 3001
+          SKIP_EMAIL_VERIFICATION: "true"
+
+  # ── PostgreSQL + Redis integration smoke test ─────────────────────────────
+  integration:
+    name: Integration — PostgreSQL & Redis smoke test
+    runs-on: ubuntu-latest
+    needs: [secrets]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sentri
+          POSTGRES_PASSWORD: sentri
+          POSTGRES_DB: sentri_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sentri -d sentri_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install dependencies (including optional pg + ioredis)
+        run: npm install && npm install pg deasync ioredis rate-limit-redis
+
+      - name: Smoke test — server starts with PostgreSQL + Redis
+        run: |
+          node src/index.js > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+          echo "Server PID: $SERVER_PID"
+
+          # Wait up to 20s for server
+          for i in $(seq 1 10); do
+            if curl -sf http://localhost:3001/health > /dev/null 2>&1; then
+              echo "✅ Server is up (PostgreSQL + Redis)"
+              break
+            fi
+            echo "Waiting ($i/10)..."
+            sleep 2
+          done
+          # Verify /health/ready reports database OK
+          READY=$(curl -sf http://localhost:3001/health/ready)
+          echo "$READY" | grep -q '"ok":true' && echo "✅ /health/ready OK" || (echo "❌ /health/ready failed: $READY" && exit 1)
+
+          # Register + login (full auth flow against PostgreSQL)
+          # INF-005: All API routes are now under /api/v1/
+          COOKIE_JAR=$(mktemp)
+          REG_RESP=$(curl -s -w "\n%{http_code}" -X POST http://localhost:3001/api/v1/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"name":"PG Bot","email":"pg@test.local","password":"PgTestPass123!"}')
+          REG_CODE=$(echo "$REG_RESP" | tail -1)
+          REG_BODY=$(echo "$REG_RESP" | sed '$d')
+          echo "Register: HTTP $REG_CODE — $REG_BODY"
+          echo "$REG_BODY" | grep -q "Account created" && echo "✅ POST /api/v1/auth/register OK (PostgreSQL)"
+
+          LOGIN_RESP=$(curl -s -w "\n%{http_code}" --max-time 10 -c "$COOKIE_JAR" -X POST http://localhost:3001/api/v1/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"email":"pg@test.local","password":"PgTestPass123!"}') || true
+          LOGIN_CODE=$(echo "$LOGIN_RESP" | tail -1)
+          LOGIN_BODY=$(echo "$LOGIN_RESP" | sed '$d')
+          echo "Login: HTTP $LOGIN_CODE — $LOGIN_BODY"
+          [ "$LOGIN_CODE" = "200" ] && echo "✅ POST /api/v1/auth/login OK (PostgreSQL)" || (echo "❌ Login failed with HTTP $LOGIN_CODE"; cat /tmp/server.log | tail -20; exit 1)
+
+          # Extract CSRF token
+          CSRF=$(grep '_csrf' "$COOKIE_JAR" | awk '{print $NF}')
+
+          # Verify authenticated endpoint works
+          curl -sf -b "$COOKIE_JAR" http://localhost:3001/api/v1/dashboard \
+            | grep -q "totalProjects" && echo "✅ /api/v1/dashboard OK (PostgreSQL)"
+
+          # Create a project (tests INSERT with named params against PostgreSQL)
+          PROJ=$(curl -sf -b "$COOKIE_JAR" -X POST http://localhost:3001/api/v1/projects \
+            -H "Content-Type: application/json" \
+            -H "X-CSRF-Token: $CSRF" \
+            -d '{"name":"PG Integration Test","url":"https://example.com"}')
+          echo "$PROJ" | grep -q '"name":"PG Integration Test"' && echo "✅ POST /api/v1/projects OK (PostgreSQL)"
+
+          # Verify logout (tests token revocation via Redis)
+          curl -sf -b "$COOKIE_JAR" -X POST http://localhost:3001/api/v1/auth/logout \
+            -H "X-CSRF-Token: $CSRF" \
+            | grep -q "Signed out" && echo "✅ POST /api/v1/auth/logout OK (Redis revocation)"
+
+          # Verify the token is revoked (should get 401)
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" http://localhost:3001/api/v1/dashboard)
+          [ "$HTTP_CODE" = "401" ] && echo "✅ Token revoked — 401 after logout (Redis)" || echo "❌ Expected 401, got $HTTP_CODE"
+
+          kill $SERVER_PID
+        env:
+          DATABASE_URL: postgres://sentri:sentri@localhost:5432/sentri_test
+          REDIS_URL: redis://localhost:6379
+          ANTHROPIC_API_KEY: sk-ant-placeholder-for-ci
+          PORT: 3001
+          SKIP_EMAIL_VERIFICATION: "true"
+
+  # ── Frontend ──────────────────────────────────────────────────────────────
+  frontend:
+    name: Frontend — Install & Build
+    runs-on: ubuntu-latest
+    needs: [secrets]
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Build (catches JSX errors, bad imports, missing files)
+        run: npm run build
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 3
+
+  # ── Cross-browser smoke (DIF-002b gap 2) ──────────────────────────────────
+  # Lives in its own workflow at `.github/workflows/cross-browser.yml` so it
+  # can be path-filtered (only runs on PRs touching the runner) and run on a
+  # nightly cron, instead of doubling CI time on every PR.
+
+  # ── UI E2E (Playwright) ───────────────────────────────────────────────────
+  ui-e2e:
+    name: UI E2E — Playwright smoke (Chromium)
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install root Playwright tooling
+        run: npm install
+
+      - name: Install backend dependencies
+        run: npm --prefix backend install
+
+      - name: Install frontend dependencies
+        run: npm --prefix frontend install
+
+      - name: Provision Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Start backend + frontend and run UI E2E
+        run: |
+          npm --prefix backend run start > /tmp/backend.log 2>&1 &
+          BACKEND_PID=$!
+          echo "Backend PID: $BACKEND_PID"
+
+          npm --prefix frontend run dev -- --host 127.0.0.1 --port 4173 > /tmp/frontend.log 2>&1 &
+          FRONTEND_PID=$!
+          echo "Frontend PID: $FRONTEND_PID"
+
+          # Wait for backend
+          for i in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:3001/health > /dev/null 2>&1; then
+              echo "✅ Backend is up"
+              break
+            fi
+            echo "Waiting for backend ($i/20)..."
+            sleep 2
+          done
+
+          # Wait for frontend
+          for i in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:4173/login > /dev/null 2>&1; then
+              echo "✅ Frontend is up"
+              break
+            fi
+            echo "Waiting for frontend ($i/20)..."
+            sleep 2
+          done
+
+          RUN_UI_E2E=true npx playwright test -c tests/e2e/playwright.config.mjs --project=ui-chromium
+
+          kill $FRONTEND_PID || true
+          kill $BACKEND_PID || true
+        env:
+          SKIP_EMAIL_VERIFICATION: "true"
+          PORT: 3001
+
+  # ── Docs (VitePress + JSDoc assembly) ────────────────────────────────────
+  docs:
+    name: Docs — VitePress Build
+    runs-on: ubuntu-latest
+    needs: [backend]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm install
+
+      - name: Generate JSDoc
+        working-directory: backend
+        run: npx jsdoc -c jsdoc.json
+
+      - name: Install docs dependencies
+        working-directory: docs
+        run: npm install
+
+      - name: Copy JSDoc output into VitePress public folder
+        run: |
+          mkdir -p docs/public/jsdoc
+          cp -r backend/docs-api/* docs/public/jsdoc/
+
+      - name: Build VitePress
+        working-directory: docs
+        run: npm run build
+
+  # ── Docker build ──────────────────────────────────────────────────────────
+  docker:
+    name: Docker — Build Both Images
+    runs-on: ubuntu-latest
+    needs: [backend, frontend, integration]
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: false
+          load: true
+          tags: sentri-backend:ci
+          # GitHub Actions cache — speeds up repeat builds significantly
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test backend container (mirrors Render)
+        run: |
+          docker run -d --name sentri-ci \
+            -e ANTHROPIC_API_KEY=sk-ant-placeholder-for-ci \
+            -e PORT=3001 \
+            -e SKIP_EMAIL_VERIFICATION=true \
+            -p 3001:3001 \
+            sentri-backend:ci
+
+          # Wait for the container to become healthy (up to 30s, use /health which is public)
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:3001/health > /dev/null 2>&1; then
+              echo "✅ Backend container is healthy"
+              break
+            fi
+            echo "Waiting ($i/15)..."
+            sleep 2
+          done
+
+          # Register + login (cookie-based auth, INF-005: /api/v1/)
+          COOKIE_JAR=$(mktemp)
+          curl -sf -X POST http://localhost:3001/api/v1/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"name":"CI Bot","email":"ci@test.local","password":"CiTestPass123!"}'
+
+          curl -sf -c "$COOKIE_JAR" -X POST http://localhost:3001/api/v1/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"email":"ci@test.local","password":"CiTestPass123!"}' > /dev/null
+
+          curl -sf -b "$COOKIE_JAR" http://localhost:3001/api/v1/dashboard \
+            | grep -q "totalProjects" \
+            && echo "✅ /api/v1/dashboard OK" \
+            || (docker logs sentri-ci && exit 1)
+
+          docker stop sentri-ci
+
+      - name: Build frontend Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: false
+          load: true
+          tags: sentri-frontend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

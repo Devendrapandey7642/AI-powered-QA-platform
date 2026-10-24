@@ -1,0 +1,6 @@
+apiVersion: v2
+name: sentri
+description: AI Powered QA Platform Kubernetes deployment chart
+version: 0.1.0
+appVersion: "latest"
+type: application

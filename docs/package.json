@@ -1,0 +1,13 @@
+{
+  "name": "ai-powered-qa-platform-docs",
+  "version": "1.9.1",
+  "private": true,
+  "scripts": {
+    "dev": "vitepress dev",
+    "build": "vitepress build",
+    "preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.3"
+  }
+}

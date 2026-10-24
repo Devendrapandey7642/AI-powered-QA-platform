@@ -1,0 +1,398 @@
+import { useRef, useEffect, useState, useCallback } from "react";
+
+/**
+ * LiveBrowserView
+ *
+ * Renders CDP screencast frames (base64 JPEG) onto a <canvas> element.
+ * Uses a requestAnimationFrame-throttled paint loop so burst frames from
+ * the SSE channel don't overwhelm the GPU.
+ *
+ * When `onInput` is provided the canvas becomes interactive: pointer events
+ * (click, mousedown, mouseup, mousemove, wheel) and keyboard events are
+ * captured, scaled from CSS pixels to the browser viewport coordinate space,
+ * and forwarded to the server via `onInput(event)`. This is what makes the
+ * recorder actually work — without forwarding, the canvas is read-only.
+ *
+ * Props:
+ *   frames      — array, we only use frames[0] (latest frame).
+ *   fallback    — ReactNode to render when no frames have arrived yet.
+ *   label       — optional string shown in the corner overlay.
+ *   onInput     — optional (event: Object) => void  — when provided the
+ *                 canvas captures pointer+keyboard events and calls this
+ *                 with CDP-shaped event objects. The parent is responsible
+ *                 for forwarding to the server.
+ *   viewportW   — server-side browser viewport width (default 1280).
+ *   viewportH   — server-side browser viewport height (default 720).
+ */
+export default function LiveBrowserView({
+  frames = [],
+  fallback = null,
+  label = "",
+  onInput = null,
+  viewportW = 1280,
+  viewportH = 720,
+  // DIF-015c Gap 2 (point-and-click assert UX) — when `assertMode` is
+  // true the canvas SUPPRESSES `onInput` forwarding entirely (clicks
+  // would otherwise navigate / submit the page under inspection). The
+  // canvas instead calls `onProbe({x, y})` on hover (debounced by the
+  // parent) and `onPick({selector, label})` on click. `highlightRect` is
+  // the viewport-space rect (from the latest probe response) drawn as
+  // an overlay outline on top of the canvas frame.
+  assertMode = false,
+  onProbe = null,
+  onPick = null,
+  highlightRect = null,
+}) {
+  const canvasRef = useRef(null);
+  const pendingRef = useRef(null); // latest base64 not yet painted
+  const rafRef = useRef(null);
+  const [hasFrames, setHasFrames] = useState(false);
+  // Track pressed keys so we can emit keyUp on blur (prevents stuck keys)
+  const pressedKeys = useRef(new Set());
+
+  // ── Paint loop ────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const frame = frames[0];
+    if (!frame) return;
+
+    setHasFrames(true);
+    pendingRef.current = frame;
+
+    if (rafRef.current) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      const data = pendingRef.current;
+      pendingRef.current = null;
+      if (!data || !canvasRef.current) return;
+
+      const img = new Image();
+      img.onload = () => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        if (canvas.width !== img.naturalWidth) canvas.width = img.naturalWidth;
+        if (canvas.height !== img.naturalHeight) canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0);
+      };
+      img.src = `data:image/jpeg;base64,${data}`;
+    });
+  }, [frames]);
+
+  useEffect(() => () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); }, []);
+
+  // ── Coordinate scaling ────────────────────────────────────────────────────
+  // The canvas CSS size differs from the logical viewport size on the server.
+  // We must scale pointer coordinates so a click at CSS position (x,y) maps
+  // to the correct pixel in the 1280×720 (or configured) headless browser.
+  const scaleCoords = useCallback((cssX, cssY) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return { x: 0, y: 0 };
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: (cssX - rect.left) * (viewportW / rect.width),
+      y: (cssY - rect.top) * (viewportH / rect.height),
+    };
+  }, [viewportW, viewportH]);
+
+  // ── Modifier bitmask ──────────────────────────────────────────────────────
+  // CDP modifiers: Alt=1, Ctrl=2, Meta=4, Shift=8
+  const modifiers = useCallback((e) => (
+    (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0)
+  ), []);
+
+  // ── Pointer handlers ──────────────────────────────────────────────────────
+  const handleMouseDown = useCallback((e) => {
+    if (!onInput) return;
+    // DIF-015c Gap 2 — in assert mode, DO NOT forward the press to the
+    // page under inspection (a click on a submit button would navigate
+    // away and tear down the recording context). We still call
+    // preventDefault to suppress text-selection on the canvas.
+    e.preventDefault();
+    canvasRef.current?.focus();
+    if (assertMode) return;
+    const { x, y } = scaleCoords(e.clientX, e.clientY);
+    onInput({ type: "mousePressed", x, y, button: e.button, clickCount: 1, modifiers: modifiers(e) });
+  }, [onInput, scaleCoords, modifiers, assertMode]);
+
+  const handleMouseUp = useCallback((e) => {
+    if (!onInput) return;
+    e.preventDefault();
+    if (assertMode) {
+      // DIF-015c Gap 2 — releasing the mouse in assert mode commits the
+      // pick. Fire onPick with the current highlight (if any) so the
+      // parent can pre-fill its verification form. We do NOT re-probe
+      // here because the debounced hover probe has already set
+      // `highlightRect`; firing another probe on every click would
+      // double the round-trip cost for no operator-visible benefit.
+      if (onPick && highlightRect) {
+        onPick({ rect: highlightRect });
+      }
+      return;
+    }
+    const { x, y } = scaleCoords(e.clientX, e.clientY);
+    onInput({ type: "mouseReleased", x, y, button: e.button, clickCount: 1, modifiers: modifiers(e) });
+  }, [onInput, scaleCoords, modifiers, assertMode, onPick, highlightRect]);
+
+  const handleMouseMove = useCallback((e) => {
+    if (!onInput) return;
+    const { x, y } = scaleCoords(e.clientX, e.clientY);
+    if (assertMode) {
+      // DIF-015c Gap 2 — in assert mode, route the move to onProbe (the
+      // parent debounces these to ~120ms and POSTs to /record/.../probe
+      // for the selector + rect). The page itself receives NO mouse
+      // event — its event handlers stay quiet so the operator can
+      // inspect without triggering side effects (hover tooltips, mouse-
+      // tracking analytics).
+      if (onProbe) onProbe({ x, y });
+      return;
+    }
+    // Only include `button` when a button is actually held — otherwise the
+    // backend must dispatch CDP button "none" so an idle hover isn't
+    // interpreted as a held left-click drag.
+    // `MouseEvent.button` is always 0 during `mousemove` per the DOM spec —
+    // only `MouseEvent.buttons` (bitmask: 1=left, 2=right, 4=middle) reflects
+    // which button is currently pressed. Derive the held button from the
+    // bitmask so right-/middle-button drags forward the correct CDP button.
+    const evt = { type: "mouseMoved", x, y, modifiers: modifiers(e) };
+    if (e.buttons > 0) {
+      evt.button = (e.buttons & 2) ? 2 : (e.buttons & 4) ? 1 : 0;
+    }
+    onInput(evt);
+  }, [onInput, scaleCoords, modifiers, assertMode, onProbe]);
+
+  // Wheel events are forwarded via a non-passive native listener (see effect
+  // below). React 18 registers `onWheel` as passive by default, so calling
+  // `preventDefault()` on the synthetic event is silently ignored — without
+  // the imperative listener the surrounding modal/page would scroll
+  // underneath the canvas while the user scrolls inside the recorded browser.
+  useEffect(() => {
+    if (!onInput) return undefined;
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const onWheelNative = (e) => {
+      e.preventDefault();
+      // DIF-015c Gap 2 — in assert mode the wheel must not scroll the
+      // page under inspection (the operator is still inspecting a
+      // stationary layout). The page's scroll position should change
+      // ONLY via real clicks once assert mode is exited.
+      if (assertMode) return;
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+      const x = (e.clientX - rect.left) * (viewportW / rect.width);
+      const y = (e.clientY - rect.top) * (viewportH / rect.height);
+      const mods = (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
+      onInput({ type: "scroll", x, y, deltaX: e.deltaX, deltaY: e.deltaY, modifiers: mods });
+    };
+    canvas.addEventListener("wheel", onWheelNative, { passive: false });
+    return () => canvas.removeEventListener("wheel", onWheelNative);
+  }, [onInput, viewportW, viewportH, assertMode]);
+
+  // ── Keyboard handlers ─────────────────────────────────────────────────────
+  // CDP's Input.dispatchKeyEvent only triggers default actions for non-printable
+  // keys (Backspace, Enter, Tab, Arrows, etc.) when `windowsVirtualKeyCode` is
+  // supplied. We forward `e.keyCode` from the DOM event — it's deprecated for
+  // new code but still populated by every modern browser specifically for cases
+  // like this. Without it Backspace/Enter/Tab fire keyDown but the page never
+  // reacts (no character deleted, no form submitted, no focus change).
+  const handleKeyDown = useCallback((e) => {
+    if (!onInput) return;
+    e.preventDefault(); // prevent browser shortcuts (Ctrl+W, etc.)
+    // DIF-015c Gap 2 — assert mode is pointer-only; suppress key
+    // forwarding so the operator can't accidentally type into a
+    // focused input on the page under inspection while picking a
+    // selector. The page's typed value would persist after assert
+    // mode toggled off and surprise the operator at replay time.
+    if (assertMode) return;
+    pressedKeys.current.add(e.key);
+    // CDP `Input.dispatchKeyEvent` with type=keyDown and a non-empty `text`
+    // field already synthesises text input in the page. Sending a separate
+    // `char` event for the same key would insert the character a second time
+    // (e.g. typing "hi" produces "hhii"). Only emit keyDown — with `text`
+    // populated for printable characters — and let CDP handle text insertion.
+    onInput({
+      type: "keyDown",
+      key: e.key,
+      code: e.code,
+      keyCode: e.keyCode,
+      text: e.key.length === 1 ? e.key : "",
+      modifiers: modifiers(e),
+    });
+  }, [onInput, modifiers, assertMode]);
+
+  const handleKeyUp = useCallback((e) => {
+    if (!onInput) return;
+    e.preventDefault();
+    if (assertMode) return;
+    pressedKeys.current.delete(e.key);
+    onInput({
+      type: "keyUp",
+      key: e.key,
+      code: e.code,
+      keyCode: e.keyCode,
+      modifiers: modifiers(e),
+    });
+  }, [onInput, modifiers, assertMode]);
+
+  // Release all held keys when the canvas loses focus so we never get stuck keys
+  const handleBlur = useCallback(() => {
+    if (!onInput) return;
+    for (const key of pressedKeys.current) {
+      onInput({ type: "keyUp", key, code: "", modifiers: 0 });
+    }
+    pressedKeys.current.clear();
+  }, [onInput]);
+
+  // ── Render ────────────────────────────────────────────────────────────────
+  const isInteractive = Boolean(onInput);
+
+  if (!hasFrames) {
+    return fallback ?? (
+      <div style={{
+        // DIF-015c Gap 5 — match the wrapper aspect ratio to the actual
+        // server-side viewport so device profiles (iPhone 14 = 390×844 ≈
+        // 9:19, Pixel 7 = 412×915, etc.) don't letterbox inside a
+        // hardcoded 16:9 box. Pre-Gap-5 desktop default (1280×720) still
+        // resolves to 16:9, so existing recordings render bit-for-bit
+        // identically.
+        aspectRatio: `${viewportW} / ${viewportH}`, width: "100%", background: "#0a0a0f",
+        borderRadius: 8, display: "flex", alignItems: "center",
+        justifyContent: "center", flexDirection: "column", gap: 10,
+      }}>
+        <div style={{
+          width: 32, height: 32, borderRadius: "50%",
+          border: "3px solid #1e40af", borderTopColor: "transparent",
+          animation: "spin 0.9s linear infinite",
+        }} />
+        <div style={{ fontSize: "0.75rem", color: "#475569" }}>
+          Waiting for browser stream…
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    // DIF-015c Gap 5 — wrapper aspect ratio is computed from the actual
+    // viewport (`viewportW / viewportH`) instead of a hardcoded 16:9.
+    // Without this fix, mobile device profiles (iPhone 14 = 390×844 ≈
+    // 9:19, Pixel 7 = 412×915) letterbox inside a 16:9 box and the
+    // canvas's `objectFit: "contain"` shrinks the live frame to a thin
+    // vertical strip in the centre — leaving wide horizontal dead-zones
+    // that `scaleCoords()` (line 87) and the assert-mode highlight
+    // overlay (line 310) still treat as visible content. Coordinates
+    // mapped from those dead-zones produce wildly wrong viewport pixels
+    // (an extreme case: a click at the dead-zone's left edge maps to
+    // viewport x≈144 instead of x=0 for an iPhone 14 canvas in an
+    // 800px-wide CSS box). Driving the wrapper from the real viewport
+    // means the canvas always fills the wrapper exactly — no
+    // letterboxing — so `getBoundingClientRect()` IS the content rect
+    // and every existing scaling formula stays correct without changes.
+    // Desktop default (1280×720) still resolves to 16:9 so pre-Gap-5
+    // recordings render bit-for-bit identically.
+    <div style={{ position: "relative", borderRadius: 8, overflow: "hidden", background: "#000", aspectRatio: `${viewportW} / ${viewportH}`, width: "100%" }}>
+      <canvas
+        ref={canvasRef}
+        tabIndex={isInteractive ? 0 : undefined}
+        style={{
+          width: "100%", height: "100%", objectFit: "contain", display: "block",
+          // Always use the default arrow cursor — matches Playwright codegen,
+          // Chrome DevTools recorder, and Browserbase. Crosshair (`+`) would
+          // imply a coordinate picker, which is misleading since the user is
+          // driving a real browser, not selecting a point. The hand cursor
+          // still appears when hovering an interactive element via standard
+          // browser propagation from the embedded page's own cursor styling.
+          //
+          // DIF-015c Gap 2 — switch to the crosshair cursor in assert
+          // mode because the operator IS picking a coordinate (target
+          // element under cursor), and a crosshair signals "click to
+          // select" rather than the regular drive-the-page interaction.
+          cursor: assertMode ? "crosshair" : "default",
+          outline: "none", // hide focus ring on canvas; we show our own indicator
+        }}
+        // Pointer events
+        onMouseDown={isInteractive ? handleMouseDown : undefined}
+        onMouseUp={isInteractive ? handleMouseUp : undefined}
+        onMouseMove={isInteractive ? handleMouseMove : undefined}
+        // Wheel listener is attached imperatively in a useEffect with
+        // { passive: false } so preventDefault() actually works (React 18
+        // registers onWheel as passive). See the wheel-listener effect above.
+        // Keyboard events — canvas must be focusable (tabIndex=0) to receive these
+        onKeyDown={isInteractive ? handleKeyDown : undefined}
+        onKeyUp={isInteractive ? handleKeyUp : undefined}
+        onBlur={isInteractive ? handleBlur : undefined}
+        // Prevent context menu from stealing right-click events
+        onContextMenu={isInteractive ? (e) => e.preventDefault() : undefined}
+      />
+      {/* DIF-015c Gap 2 — Highlight overlay drawn on top of the canvas
+          frame in assert mode. `highlightRect` is in viewport space
+          (the same coordinate system the probe returns); scale it down
+          to canvas-CSS space using the canvas's actual rendered width.
+          Positioned absolutely with `pointer-events: none` so the
+          underlying canvas still receives mouse events. The 2px solid
+          outline + soft drop shadow matches Chrome DevTools' element
+          inspector for visual familiarity. */}
+      {assertMode && highlightRect && canvasRef.current && (() => {
+        const canvas = canvasRef.current;
+        const rect = canvas.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return null;
+        const sx = rect.width / viewportW;
+        const sy = rect.height / viewportH;
+        // Only the computed rect (left/top/width/height) stays inline —
+        // every static visual (border, shadow, transition, z-index)
+        // lives in `.recorder-highlight-overlay`. AGENT.md `:127`
+        // explicitly carves out "dynamic/data-driven values" as the
+        // legitimate inline-style use case.
+        return (
+          <div
+            className="recorder-highlight-overlay"
+            style={{
+              left: highlightRect.x * sx,
+              top: highlightRect.y * sy,
+              width: Math.max(2, highlightRect.width * sx),
+              height: Math.max(2, highlightRect.height * sy),
+            }}
+          />
+        );
+      })()}
+      {/* DIF-015c Gap 2 — Assert-mode badge so the operator can tell at
+          a glance the canvas is in inspect mode rather than drive mode. */}
+      {assertMode && (
+        <div className="recorder-assert-badge">
+          ASSERT MODE — CLICK TO PICK
+        </div>
+      )}
+      {/* Live indicator badge */}
+      <div style={{
+        position: "absolute", top: 8, left: 8,
+        display: "flex", alignItems: "center", gap: 5,
+        background: "rgba(0,0,0,0.65)", backdropFilter: "blur(4px)",
+        borderRadius: 99, padding: "3px 9px",
+      }}>
+        <div style={{
+          width: 7, height: 7, borderRadius: "50%", background: "#ef4444",
+          animation: "pulse 1.4s ease-in-out infinite",
+          boxShadow: "0 0 6px #ef4444",
+        }} />
+        <span style={{ fontSize: "0.65rem", fontWeight: 700, color: "#fff", letterSpacing: "0.06em" }}>
+          LIVE
+        </span>
+        {label && (
+          <span style={{ fontSize: "0.63rem", color: "rgba(255,255,255,0.6)", marginLeft: 2 }}>
+            {label}
+          </span>
+        )}
+      </div>
+      {/* Interactive mode hint — shown briefly when canvas gains focus */}
+      {isInteractive && (
+        <div style={{
+          position: "absolute", bottom: 8, left: "50%", transform: "translateX(-50%)",
+          background: "rgba(0,0,0,0.6)", backdropFilter: "blur(4px)",
+          borderRadius: 6, padding: "3px 10px",
+          fontSize: "0.65rem", color: "rgba(255,255,255,0.7)",
+          pointerEvents: "none", whiteSpace: "nowrap",
+        }}>
+          Click inside to interact · scroll to scroll · type to type
+        </div>
+      )}
+    </div>
+  );
+}

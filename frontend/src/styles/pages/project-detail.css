@@ -1,0 +1,345 @@
+/**
+ * ProjectDetail + ProjectHeader — page-specific styles
+ *
+ * Replaces the most duplicated inline style={{}} patterns.
+ * Scoped by `.pd-*` prefix (project-detail).
+ */
+
+/* ── Filter pill button (draft/approved/rejected/all + ui/api) ──────────────── */
+.pd-filter-pill {
+  padding: 5px 12px; border-radius: 99px; font-size: 0.78rem; font-weight: 600;
+  background: transparent; cursor: pointer; transition: all 0.12s;
+  border: 1px solid var(--border); color: var(--text2);
+}
+
+/* ── Bulk action bar ────────────────────────────────────────────────────────── */
+.pd-bulk-bar {
+  display: flex; align-items: center; gap: 8;
+  padding: 10px 14px;
+  background: var(--accent-bg); border: 1px solid rgba(91,110,245,0.2);
+  border-radius: 8px; margin-bottom: 12px; flex-wrap: wrap;
+}
+.pd-bulk-label {
+  font-size: 0.82rem; color: var(--accent); font-weight: 500;
+}
+
+/* ── "NEW" badge on test rows ───────────────────────────────────────────────── */
+.pd-new-badge {
+  font-size: 0.6rem; font-weight: 700; padding: 1px 5px;
+  border-radius: 4px; background: var(--green); color: #fff;
+  letter-spacing: 0.03em; line-height: 1.5;
+}
+
+/* ── Pagination bar ─────────────────────────────────────────────────────────── */
+.pd-pagination {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-top: 1px solid var(--border);
+}
+
+/* ── Confirm modal body text ────────────────────────────────────────────────── */
+.pd-confirm-title { font-weight: 700; font-size: 1rem; margin-bottom: 10px; }
+.pd-confirm-body  { font-size: 0.875rem; color: var(--text2); margin-bottom: 20px; line-height: 1.6; }
+
+/* ── Tab bar (project detail) ───────────────────────────────────────────────── */
+.pd-tab-bar {
+  display: flex; border-bottom: 1px solid var(--border); margin-bottom: 14px;
+}
+.pd-tab {
+  background: none; border: none; cursor: pointer;
+  padding: 10px 18px; font-size: 0.875rem;
+  display: flex; align-items: center; gap: 6;
+  margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+  color: var(--text2); font-weight: 400;
+}
+.pd-tab--active {
+  font-weight: 600; color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.pd-tab-badge {
+  background: var(--amber); color: #fff; border-radius: 99px;
+  font-size: 0.65rem; font-weight: 700; padding: 1px 6px;
+}
+
+/* ── Search input with icon ─────────────────────────────────────────────────── */
+.pd-search-wrap { position: relative; }
+.pd-search-icon {
+  position: absolute; left: 9px; top: 50%; transform: translateY(-50%);
+  pointer-events: none;
+}
+.pd-search-input {
+  padding-left: 26px; height: 32px; font-size: 0.82rem; width: 200px;
+}
+
+/* ── Filter row ─────────────────────────────────────────────────────────────── */
+.pd-filter-row {
+  display: flex; align-items: center; gap: 8;
+  margin-bottom: 12px; flex-wrap: wrap;
+}
+.pd-filter-divider {
+  width: 1px; height: 18px; background: var(--border);
+  margin: 0 4px; flex-shrink: 0;
+}
+
+/* ── Banner (amber/green) ───────────────────────────────────────────────────── */
+.pd-banner {
+  margin-bottom: 14px; padding: 10px 16px;
+  border-radius: 10px; display: flex; align-items: center; gap: 10;
+}
+.pd-banner--amber {
+  background: var(--amber-bg); border: 1px solid #fcd34d;
+  margin-bottom: 16px;
+}
+.pd-banner--green {
+  background: var(--green-bg); border: 1px solid #86efac;
+}
+.pd-banner-text-amber { font-size: 0.82rem; color: #92400e; }
+.pd-banner-text-green { font-size: 0.82rem; color: #14532d; }
+
+/* ── Project header card ────────────────────────────────────────────────────── */
+.pd-header { padding: 24px; margin-bottom: 16px; }
+
+/* AUTO-003b: header aggregate line under the project URL — small, muted,
+   non-fatal (only renders when `getApprovalStats` resolves with total > 0). */
+.pd-approval-aggregate { margin-top: 4px; }
+.pd-header-top {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  flex-wrap: wrap; gap: 16px;
+}
+.pd-header-identity { display: flex; gap: 14px; align-items: center; }
+.pd-header-actions {
+  display: flex; flex-direction: column; gap: 10px; align-items: flex-end;
+}
+.pd-header-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+/* ── Stat row (below header) ────────────────────────────────────────────────── */
+.pd-stats {
+  display: flex; gap: 24px; margin-top: 20px; padding-top: 16px;
+  border-top: 1px solid var(--border); flex-wrap: wrap;
+}
+.pd-stat-value { font-size: 1.4rem; font-weight: 700; }
+.pd-stat-label { font-size: 0.73rem; color: var(--text3); margin-top: 2px; }
+
+/* ── Segmented control (crawl/explore mode) ─────────────────────────────────── */
+.pd-segmented {
+  display: flex; border-radius: var(--radius); overflow: hidden;
+  border: 1px solid var(--border); flex-shrink: 0;
+}
+.pd-segmented-btn {
+  padding: 5px 12px; border: none; cursor: pointer;
+  font-size: 0.78rem; transition: all 0.12s;
+}
+
+/* ── Popover / dropdown overlay ─────────────────────────────────────────────── */
+.pd-popover-backdrop { position: fixed; inset: 0; z-index: 99; }
+.pd-popover {
+  position: absolute; z-index: 100;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); box-shadow: 0 12px 40px rgba(0,0,0,0.15);
+}
+.pd-dropdown {
+  position: absolute; z-index: 100;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  min-width: 220px; padding: 4px;
+}
+.pd-dropdown-heading {
+  padding: 6px 12px; font-size: 0.7rem; color: var(--text3);
+  font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em;
+}
+.pd-dropdown-item {
+  display: block; padding: 8px 12px; border-radius: 6px;
+  text-decoration: none; color: var(--text);
+}
+.pd-dropdown-item:hover { background: var(--bg2); text-decoration: none; }
+.pd-dropdown-item-title { font-size: 0.84rem; font-weight: 500; }
+.pd-dropdown-item-desc  { font-size: 0.72rem; color: var(--text3); margin-top: 1px; }
+
+/* ── Workers selector ───────────────────────────────────────────────────────── */
+.pd-workers {
+  display: flex; align-items: center; gap: 4px; flex-shrink: 0;
+  padding: 3px 8px; border-radius: var(--radius);
+  border: 1px solid var(--border); background: var(--surface);
+  font-size: 0.72rem; color: var(--text2);
+}
+.pd-workers-select {
+  background: transparent; border: none; color: var(--accent);
+  font-weight: 700; font-size: 0.78rem; cursor: pointer;
+  font-family: var(--font-mono); padding: 0; outline: none;
+}
+
+/* ── Checkbox accent ────────────────────────────────────────────────────────── */
+.pd-checkbox { accent-color: var(--accent); cursor: pointer; }
+
+/* ── Environments tab (DIF-012) ─────────────────────────────────────────────── */
+/* Scoped to the EnvironmentsTab panel mounted on ProjectDetail. Mirrors the
+   `.pd-*` prefix used by sibling tabs (review, runs, traceability). Only
+   the env-specific bits live here — buttons, cards, tables, flex helpers,
+   inputs, and text colours all reuse components.css / utilities.css. */
+.pd-env-header {
+  padding: 16px 20px 0;
+  display: flex; align-items: center; gap: 8px;
+}
+.pd-env-heading { font-weight: 700; font-size: 0.95rem; margin: 0; }
+.pd-env-hint    { font-size: 0.73rem; color: var(--text3); margin-left: 8px; }
+.pd-env-empty   { padding: 20px; font-size: 0.82rem; color: var(--text3); }
+.pd-env-row-name    { font-weight: 600; font-size: 0.82rem; }
+.pd-env-row-url     { font-size: 0.78rem; color: var(--text2); }
+.pd-env-row-cred    {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 0.73rem; color: var(--text2);
+}
+.pd-env-row-actions { display: flex; gap: 4px; }
+.pd-env-actions-col { width: 160px; }
+
+/* Loading-state spinner — replaces inline { opacity: 0.3, marginBottom: 12 }
+   on the icon inside .pd-empty for the EnvironmentsTab loading view. */
+.pd-env-loading-icon { opacity: 0.3; margin-bottom: 12px; }
+
+/* Add/edit form panel */
+.pd-env-form          { padding: 18px 20px; }
+.pd-env-form-title    { font-weight: 700; font-size: 0.95rem; margin: 0 0 12px; }
+.pd-env-form-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;
+}
+.pd-env-form-label    { font-size: 0.78rem; color: var(--text2); }
+.pd-env-form-input    { height: 38px; }
+.pd-env-form-actions  { display: flex; justify-content: flex-end; gap: 8px; }
+
+@media (max-width: 600px) {
+  .pd-env-form-grid { grid-template-columns: 1fr; }
+  .pd-env-actions-col { width: auto; }
+}
+
+/* ── Empty state (centered) ─────────────────────────────────────────────────── */
+.pd-empty {
+  padding: 60px 24px; text-align: center; color: var(--text2);
+}
+.pd-empty-sm {
+  padding: 48px 24px; text-align: center; color: var(--text2); font-size: 0.875rem;
+}
+
+/* ONB-002 (audit §6.4) — coached variant: same centred layout as `.pd-empty-sm`
+   but with explicit title + description + CTA hierarchy. Matches the
+   structural rhythm of the shared `<EmptyState>` primitive's bare variant
+   so the visual weight feels uniform across pages. The container stays
+   `.pd-empty-sm` (so cards keep the same padding); this modifier just
+   adds the inner spacing rules for the new child elements. */
+.pd-empty-sm--coached {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+.pd-empty-sm__title {
+  font-weight: 600; font-size: 0.95rem; color: var(--text);
+}
+.pd-empty-sm__desc {
+  font-size: 0.82rem; color: var(--text3); line-height: 1.5;
+  max-width: 420px; margin-bottom: 6px;
+}
+.pd-empty-sm__cta {
+  margin-top: 4px;
+}
+.pd-empty-sm__actions {
+  display: flex; gap: 8px; margin-top: 4px;
+}
+
+/* ── Responsive: 900px (icon-rail sidebar breakpoint) ───────────────────────── */
+@media (max-width: 900px) {
+  /* Header card: stack identity + actions vertically */
+  .pd-header-top {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .pd-header-actions {
+    align-items: flex-start;
+    flex-direction: row;
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  /* Stats row: allow wrapping with tighter gap */
+  .pd-stats {
+    gap: 16px;
+  }
+
+  /* Table: hide Type + Confidence columns */
+  .pd-review-table .table th:nth-child(6),   /* Type */
+  .pd-review-table .table td:nth-child(6),
+  .pd-review-table .table th:nth-child(7),   /* Confidence */
+  .pd-review-table .table td:nth-child(7) {
+    display: none;
+  }
+
+  /* Filter row: wrap pills */
+  .pd-filter-row {
+    row-gap: 6px;
+  }
+}
+
+/* ── Responsive: 600px (full-hide sidebar breakpoint) ───────────────────────── */
+@media (max-width: 600px) {
+  .pd-header {
+    padding: 18px;
+  }
+
+  /* Also hide Test ID column */
+  .pd-review-table .table th:nth-child(2),   /* Test ID */
+  .pd-review-table .table td:nth-child(2) {
+    display: none;
+  }
+
+  /* Pagination: stack */
+  .pd-pagination {
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* Bulk bar: tighten */
+  .pd-bulk-bar {
+    padding: 8px 12px;
+    gap: 6px;
+  }
+
+  /* Tab bar: smaller padding on tabs */
+  .pd-tab {
+    padding: 8px 12px;
+    font-size: 0.82rem;
+  }
+}
+
+/* ── Responsive: 480px (extra-small phones) ─────────────────────────────────── */
+@media (max-width: 480px) {
+  /* Hide Status column — Review badge is enough */
+  .pd-review-table .table th:nth-child(4),   /* Status */
+  .pd-review-table .table td:nth-child(4) {
+    display: none;
+  }
+
+  /* Hide Actions column — user can tap row to navigate */
+  .pd-review-table .table th:nth-child(8),   /* Actions */
+  .pd-review-table .table td:nth-child(8) {
+    display: none;
+  }
+
+  /* Table cell padding: handled by shared rule in utilities.css */
+
+  /* Search input: full width */
+  .pd-search-input {
+    width: 100% !important;
+  }
+
+  .pd-filter-row {
+    gap: 6px;
+  }
+
+  /* Banner: stack text + button */
+  .pd-banner {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+}
